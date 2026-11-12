@@ -377,5 +377,6 @@ graph LR
 - 发现并修复 Classic bootloader 的 DTR/RTS 次序错误：先 EN 低，再释放 EN 并保持 GPIO0 低，最后释放 GPIO0；回归测试检查实际复位/采样阶段的引脚逻辑。修复后 81 个测试与 Clippy 通过，release 实机进入下载模式。
 - 使用隔离环境中的 esptool 5.6.0，以 `--before no-reset --after hard-reset --no-stub chip-id` 只读识别 ESP32-D0WD-V3，随后 RTS 复位；没有上传 stub 或改写固件。
 - 固件报告的 input-only GPIO pull-up 错误和 SD 初始化失败属于板上应用日志；终端如实保留。
-- 尚未验收：TUI 原始 TX/RX 往返、物理拔插后的新选择器交互、921600 长跑、其他板型、真实 ELF/panic/coredump 以及 Linux。
+- TUI 双向收发已验证：`/boot` 后分两次发送 46 字节 ROM SYNC，累计 TX 92 字节；第二次收到 112 字节、8 个 SYNC 响应。pyserial 独立对照同样首次无响应、第二次 112 字节，符合 ROM 自动波特率同步行为；随后 `/reset` 恢复原应用。
+- 尚未验收：物理拔插后的新选择器交互、921600 长跑、其他板型、真实 ELF/panic/coredump 以及 Linux。
 
