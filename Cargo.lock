@@ -705,6 +705,7 @@ name = "gtui-terms"
 version = "0.1.0"
 dependencies = [
  "addr2line",
+ "base64",
  "chrono",
  "clap",
  "ratatui",

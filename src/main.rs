@@ -151,6 +151,9 @@ fn main() -> io::Result<()> {
     }
 
     let mut app = App::new(baud, ports, log, timestamps, loaded.macros, loaded.hooks);
+    app.config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(config::LOCAL_FILE));
     app.settings = settings;
     app.auto_reset = !(args.no_reset || cfg.no_reset.unwrap_or(false));
     app.load_history();

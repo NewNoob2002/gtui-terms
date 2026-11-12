@@ -6,6 +6,7 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 
 use crate::esp::{elf, panic};
@@ -13,7 +14,7 @@ use crate::logfile::LogFile;
 use crate::serial::reset::Kind as ResetKind;
 use crate::serial::{self, Event, PortInfo};
 use crate::term::assembler::Assembler;
-use crate::term::scrollback::{Cell, Row, Scrollback, match_mask};
+use crate::term::scrollback::{Cell, PLAIN, Row, Scrollback, match_mask};
 
 pub const SCROLLBACK_ROWS: usize = 50_000;
 pub const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
@@ -113,6 +114,7 @@ pub struct App {
     pub search_re: Option<regex::Regex>,
     pub repeat: Option<Repeat>,
     pub macros: Vec<crate::config::Macro>,
+    pub config_path: std::path::PathBuf,
     pub help: bool,
     pub raw_mode: bool,
     pub eol: Eol,
@@ -190,6 +192,7 @@ impl App {
             search_re: None,
             repeat: None,
             macros,
+            config_path: std::path::PathBuf::from(crate::config::LOCAL_FILE),
             help: false,
             raw_mode: false,
             eol: Eol::CrLf,
@@ -337,17 +340,17 @@ impl App {
         let at = now_ms();
         self.push_text(
             &format!("[hook {name}] exit {}", if ok { "0" } else { "non-zero" }),
-            1,
+            Style::new().fg(Color::Red),
             at,
         );
         for line in output.lines().take(40) {
-            self.push_text(&format!("[hook {name}] {line}"), 0, at);
+            self.push_text(&format!("[hook {name}] {line}"), PLAIN, at);
         }
         self.hook_running = None;
         self.status = format!("hook {} finished (exit {})", name, if ok { 0 } else { 1 });
         self.hook_last.insert(name, std::time::Instant::now());
         if let Some((port, kind)) = self.reopen_after_hook.take() {
-            self.push_text(&format!("[hook] reopening {port}"), 0, at);
+            self.push_text(&format!("[hook] reopening {port}"), PLAIN, at);
             self.connect_with(&port, kind);
         }
         self.version += 1;
@@ -393,22 +396,22 @@ impl App {
     fn report_panic(&mut self, report: &panic::Panic) {
         let at = now_ms();
         let head = report.lines.first().cloned().unwrap_or_default();
-        self.push_text(&format!("[panic] {head}"), 1, at);
+        self.push_text(&format!("[panic] {head}"), Style::new().fg(Color::Red), at);
         if let Some(sha) = &report.sha256 {
-            self.push_text(&format!("[panic] ELF SHA256 {sha}"), 0, at);
+            self.push_text(&format!("[panic] ELF SHA256 {sha}"), PLAIN, at);
             if let Some(elf) = &self.elf_sha {
                 let dump = sha.trim().to_ascii_lowercase();
                 if !elf.starts_with(&dump) {
                     self.push_text(
                         &format!("[panic] ELF MISMATCH: dump {dump}, loaded {elf}"),
-                        1,
+                        Style::new().fg(Color::Red),
                         at,
                     );
                 }
             }
         }
         if report.addresses.is_empty() {
-            self.push_text("[panic] no addresses recovered", 0, at);
+            self.push_text("[panic] no addresses recovered", PLAIN, at);
         }
         for &address in &report.addresses {
             let text = match &self.symbols {
@@ -420,25 +423,26 @@ impl App {
                     format!("[panic] 0x{address:08x} (no ELF loaded: pass --elf PATH)")
                 }
             };
-            self.push_text(&text, 0, at);
+            self.push_text(&text, PLAIN, at);
         }
         self.status = format!("panic decoded ({} addresses)", report.addresses.len());
         self.version += 1;
     }
 
     fn save_coredump(&mut self, text: &str) {
-        let name = format!(
-            "coredump-{}.txt",
-            chrono::Local::now().format("%Y%m%d-%H%M%S")
-        );
-        match std::fs::write(&name, text) {
-            Ok(()) => self.status = format!("coredump saved to {name}"),
-            Err(err) => self.status = format!("coredump write failed: {err}"),
-        }
+        let directory = self
+            .log
+            .as_ref()
+            .and_then(|log| log.path().parent())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        self.status = match crate::esp::coredump::save(text, directory) {
+            Ok(path) => format!("coredump saved to {}", path.display()),
+            Err(err) => format!("coredump capture failed: {err}"),
+        };
         self.version += 1;
     }
 
-    fn push_text(&mut self, text: &str, style: u8, at: u64) {
+    fn push_text(&mut self, text: &str, style: Style, at: u64) {
         let cells = text.chars().map(|ch| Cell::new(ch, style)).collect();
         self.scrollback.push(Row { cells, at });
     }
@@ -953,7 +957,7 @@ impl App {
             let at = now_ms();
             let cells = text
                 .chars()
-                .map(|ch| crate::term::scrollback::Cell::new(ch, 0))
+                .map(|ch| crate::term::scrollback::Cell::new(ch, PLAIN))
                 .collect();
             self.scrollback.push(Row { cells, at });
             self.version += 1;
@@ -1007,6 +1011,29 @@ impl App {
         let rest = text.trim_start_matches('/').trim();
         if rest == "reset" {
             self.queue_reset(false);
+            return;
+        }
+        if rest == "macro" || rest.starts_with("macro ") || rest.starts_with("macro\t") {
+            let args = rest[5..].trim_start();
+            let parsed = args
+                .split_once(char::is_whitespace)
+                .and_then(|(name, args)| {
+                    args.trim_start()
+                        .split_once(char::is_whitespace)
+                        .map(|(key, payload)| (name, key, payload.trim_start()))
+                });
+            let Some((name, key, payload)) = parsed.filter(|(_, _, text)| !text.is_empty()) else {
+                self.status = "usage: /macro <name> <f9-f12|alt+char> <text>".to_string();
+                return;
+            };
+            match crate::config::save_macro(&self.config_path, name, key, payload) {
+                Ok(entry) => {
+                    self.macros.retain(|existing| existing.name != name);
+                    self.macros.push(entry);
+                    self.status = format!("macro {name} saved to {}", self.config_path.display());
+                }
+                Err(err) => self.status = format!("macro: {err}"),
+            }
             return;
         }
         if let Some(arg) = rest.strip_prefix("eol") {
@@ -1368,7 +1395,7 @@ mod tests {
     fn regex_search_only_matches_its_pattern() {
         let mut app = app();
         for line in ["error code 12", "error code 7", "info ok"] {
-            app.push_text(line, 0, 0);
+            app.push_text(line, PLAIN, 0);
         }
         app.search_query = Some(r"re:code \d{2}".to_string());
         app.run_search();
@@ -1514,6 +1541,72 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("ping"));
+    }
+
+    #[test]
+    fn macro_command_persists_and_immediately_updates_keyboard_binding() {
+        let dir = std::env::temp_dir().join(format!("gtui-app-macro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app();
+        app.config_path = dir.join("config.toml");
+        app.start_demo();
+        app.command("/macro ping alt+p hello world");
+        assert!(app.status.starts_with("macro ping saved to "));
+        assert_eq!(app.macros.len(), 1);
+        assert_eq!(app.macros[0].text, "hello world");
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(app.status, "macro ping");
+        assert!(app.scrollback.iter().any(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+                .contains("hello world")
+        }));
+        app.command("/macro\tping\tF12\tupdated payload");
+        assert!(app.status.starts_with("macro ping saved to "));
+        assert_eq!(app.macros.len(), 1);
+        assert_eq!(app.macros[0].key, KeyCode::F(12));
+        app.on_key(key(KeyCode::F(12)));
+        assert_eq!(app.status, "macro ping");
+        let persisted: crate::config::Config =
+            toml::from_str(&std::fs::read_to_string(&app.config_path).unwrap()).unwrap();
+        assert_eq!(persisted.macros.len(), 1);
+        assert_eq!(persisted.macros[0].text, "updated payload");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_macro_commands_preserve_active_bindings_and_invalid_files() {
+        let dir =
+            std::env::temp_dir().join(format!("gtui-app-macro-errors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app();
+        app.config_path = dir.join("config.toml");
+        app.command("/macro ping f9 original");
+        assert!(app.status.starts_with("macro ping saved to "));
+        let active = app.macros.clone();
+        let original = std::fs::read_to_string(&app.config_path).unwrap();
+        app.command("/macro ping f1 rejected");
+        assert!(app.status.contains("unsupported key"));
+        assert_eq!(app.macros, active);
+        assert_eq!(std::fs::read_to_string(&app.config_path).unwrap(), original);
+        app.command("/macro ping f10");
+        assert!(app.status.starts_with("usage: /macro"));
+        assert_eq!(app.macros, active);
+        for invalid in ["[broken", "macros = 'wrong type'"] {
+            std::fs::write(&app.config_path, invalid).unwrap();
+            app.command("/macro ping f10 rejected");
+            assert!(app.status.starts_with("macro: "));
+            assert_eq!(app.macros, active);
+            assert_eq!(std::fs::read_to_string(&app.config_path).unwrap(), invalid);
+        }
+        app.config_path = dir.join("missing-parent").join("config.toml");
+        app.command("/macro ping f10 rejected");
+        assert!(app.status.contains("cannot create temporary config"));
+        assert_eq!(app.macros, active);
+        assert!(!app.config_path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

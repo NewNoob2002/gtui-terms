@@ -124,6 +124,7 @@ impl Scanner {
             }
             State::Dump { lines } => {
                 if line.contains(COREDUMP_END) {
+                    lines.push(line.to_string());
                     let text = std::mem::take(lines).join("\n");
                     self.state = State::Idle;
                     return Some(Finding::Coredump(text));

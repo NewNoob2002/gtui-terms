@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, List, ListItem, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Eol, Mode, View};
-use crate::term::scrollback::{Cell, HIGHLIGHT, PLAIN, match_mask, style_of};
+use crate::term::scrollback::{Cell, HIGHLIGHT, PLAIN, match_mask};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.mode {
@@ -80,6 +80,12 @@ fn draw_terminal(frame: &mut Frame, app: &mut App) {
     }
     if app.scrollback.dropped() > 0 {
         status.push_str(&format!(" | dropped {}", app.scrollback.dropped()));
+    }
+    if app.assembler.invalid_utf8() > 0 {
+        status.push_str(&format!(
+            " | invalid UTF-8 {}",
+            app.assembler.invalid_utf8()
+        ));
     }
     status.push_str(&format!(
         " | rx {} B {} B/s tx {} B",
@@ -169,6 +175,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
         Line::from("F1 help  F2 line/raw  F7 search  F8 hex  Ctrl+N/P next/prev hit"),
         Line::from("PageUp/PageDown scroll  Ctrl+L clear  Ctrl+T timestamps  Ctrl+Q quit"),
         Line::from("/repeat <ms> <count|0> <text>  /stop  // literal slash"),
+        Line::from("/macro <name> <f9-f12|alt+char> <text>  save a macro"),
         Line::from(""),
     ];
     if app.macros.is_empty() {
@@ -270,7 +277,7 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
                 .collect()
         })
         .unwrap_or_default();
-    let mut cells: Vec<(char, u8)> = Vec::new();
+    let mut cells: Vec<(char, Style)> = Vec::new();
     for row in app.scrollback.iter() {
         starts.push(out.len());
         cells.clear();
@@ -287,12 +294,16 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
                 Some(re) => regex_mask(&row.cells, re),
                 None => match_mask(&row.cells, &needle),
             };
-            cells.extend(
-                row.cells
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (c.ch, if mask[i] { HIGHLIGHT } else { c.style })),
-            );
+            cells.extend(row.cells.iter().enumerate().map(|(i, c)| {
+                (
+                    c.ch,
+                    if mask[i] {
+                        c.style.patch(HIGHLIGHT)
+                    } else {
+                        c.style
+                    },
+                )
+            }));
         }
         push_wrapped(&mut out, &cells, limit);
     }
@@ -328,7 +339,7 @@ fn regex_mask(cells: &[Cell], re: &regex::Regex) -> Vec<bool> {
     mask
 }
 
-fn push_wrapped(out: &mut Vec<Line<'static>>, cells: &[(char, u8)], limit: usize) {
+fn push_wrapped(out: &mut Vec<Line<'static>>, cells: &[(char, Style)], limit: usize) {
     if cells.is_empty() {
         out.push(Line::default());
         return;
@@ -347,19 +358,19 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, cells: &[(char, u8)], limit: usize
     out.push(to_line(&cells[start..]));
 }
 
-fn to_line(cells: &[(char, u8)]) -> Line<'static> {
+fn to_line(cells: &[(char, Style)]) -> Line<'static> {
     let mut spans = Vec::new();
     let mut text = String::new();
     let mut style = cells.first().map_or(PLAIN, |&(_, key)| key);
     for &(ch, key) in cells {
         if key != style {
-            spans.push(Span::styled(std::mem::take(&mut text), style_of(style)));
+            spans.push(Span::styled(std::mem::take(&mut text), style));
             style = key;
         }
         text.push(ch);
     }
     if !text.is_empty() {
-        spans.push(Span::styled(text, style_of(style)));
+        spans.push(Span::styled(text, style));
     }
     Line::from(spans)
 }
@@ -534,6 +545,86 @@ mod tests {
         let text = rendered(&mut app, 40, 6);
         assert!(text.contains("payload"));
         assert!(text.contains(':') && text.contains('.'));
+    }
+
+    #[test]
+    fn ansi_colors_and_attributes_reach_the_terminal_buffer_and_reset() {
+        let mut app = app();
+        app.on_event(Event::Data(
+            b"\x1b[31;44;1;4mA\x1b[38;5;196;48;5;23mB\x1b[38;2;1;4;0;48;2;5;6;7mC\x1b[22;24;39;49mD\x1b[91;107mE\x1b[0mF\n".to_vec(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let cells = terminal.backend().buffer().content();
+        assert_eq!(cells[0].symbol(), "A");
+        assert_eq!(cells[0].fg, Color::Red);
+        assert_eq!(cells[0].bg, Color::Blue);
+        assert!(
+            cells[0]
+                .modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+        assert_eq!(cells[1].fg, Color::Indexed(196));
+        assert_eq!(cells[1].bg, Color::Indexed(23));
+        assert!(
+            cells[1]
+                .modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+        assert_eq!(cells[2].fg, Color::Rgb(1, 4, 0));
+        assert_eq!(cells[2].bg, Color::Rgb(5, 6, 7));
+        assert!(
+            cells[2]
+                .modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+        assert_eq!(cells[3].fg, Color::Reset);
+        assert_eq!(cells[3].bg, Color::Reset);
+        assert!(cells[3].modifier.is_empty());
+        assert_eq!(cells[4].fg, Color::LightRed);
+        assert_eq!(cells[4].bg, Color::White);
+        assert_eq!(cells[5].fg, Color::Reset);
+        assert_eq!(cells[5].bg, Color::Reset);
+        assert!(cells[5].modifier.is_empty());
+    }
+
+    #[test]
+    fn search_overlay_preserves_attributes_and_adjacent_cell_styles() {
+        let mut app = app();
+        app.on_event(Event::Data(b"\x1b[31;44;1;4mAB\n".to_vec()));
+        app.search_query = Some("A".to_string());
+        app.run_search();
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let cells = terminal.backend().buffer().content();
+        assert_eq!(cells[0].fg, Color::Black);
+        assert_eq!(cells[0].bg, Color::Yellow);
+        assert!(
+            cells[0]
+                .modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+        assert_eq!(cells[1].fg, Color::Red);
+        assert_eq!(cells[1].bg, Color::Blue);
+        assert!(
+            cells[1]
+                .modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn invalid_bytes_are_visible_and_count_remains_in_status_after_clear() {
+        let mut app = app();
+        app.on_event(Event::Data(b"\xe2A\n\xffB\n".to_vec()));
+        let text = rendered(&mut app, 180, 6);
+        assert!(text.contains(r"\xE2A"), "{text}");
+        assert!(text.contains(r"\xFFB"), "{text}");
+        assert!(text.contains("invalid UTF-8 2"), "{text}");
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        let text = rendered(&mut app, 180, 6);
+        assert!(!text.contains(r"\xE2A"), "{text}");
+        assert!(text.contains("invalid UTF-8 2"), "{text}");
     }
 
     #[test]

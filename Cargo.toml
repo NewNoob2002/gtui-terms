@@ -7,6 +7,7 @@ description = "TUI serial terminal for ESP32 debugging on Windows and Linux"
 
 [dependencies]
 addr2line = "0.27"
+base64 = "0.22.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
 ratatui = "0.30.2"

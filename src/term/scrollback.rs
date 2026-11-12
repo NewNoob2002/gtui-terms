@@ -1,51 +1,25 @@
 use std::collections::VecDeque;
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 
-/// Style palette key: low 3 bits index a foreground color, bit 3 is bold.
-pub const PLAIN: u8 = 0;
-/// Pseudo style key used by the renderer for search matches.
-pub const HIGHLIGHT: u8 = u8::MAX;
+pub const PLAIN: Style = Style::new();
+pub const HIGHLIGHT: Style = Style::new().bg(Color::Yellow).fg(Color::Black);
 const CELL_BYTES: usize = std::mem::size_of::<Cell>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
-    pub style: u8,
+    pub style: Style,
 }
 
 impl Cell {
-    pub const fn new(ch: char, style: u8) -> Self {
+    pub const fn new(ch: char, style: Style) -> Self {
         Self { ch, style }
     }
 
-    pub const fn is_blank(&self) -> bool {
+    pub fn is_blank(&self) -> bool {
         self.ch == ' ' && self.style == PLAIN
     }
-}
-
-pub fn style_of(key: u8) -> Style {
-    if key == HIGHLIGHT {
-        return Style::default().bg(Color::Yellow).fg(Color::Black);
-    }
-    let color = match key & 7 {
-        1 => Some(Color::Red),
-        2 => Some(Color::Green),
-        3 => Some(Color::Yellow),
-        4 => Some(Color::Blue),
-        5 => Some(Color::Magenta),
-        6 => Some(Color::Cyan),
-        7 => Some(Color::White),
-        _ => None,
-    };
-    let mut style = Style::default();
-    if let Some(color) = color {
-        style = style.fg(color);
-    }
-    if key & 8 != 0 {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    style
 }
 
 /// Case-insensitive substring mask over `cells` (`needle` already lowercased).
@@ -148,22 +122,15 @@ mod tests {
 
     #[test]
     fn match_mask_is_case_insensitive_and_masks_every_match() {
-        let cells: Vec<Cell> = "Hello hello".chars().map(|ch| Cell::new(ch, 0)).collect();
+        let cells: Vec<Cell> = "Hello hello"
+            .chars()
+            .map(|ch| Cell::new(ch, PLAIN))
+            .collect();
         let needle: Vec<char> = "hello".chars().collect();
         let mask = match_mask(&cells, &needle);
         assert_eq!(mask.iter().filter(|hit| **hit).count(), 10);
         assert!(mask[0]);
         assert!(!mask[5]);
-    }
-
-    #[test]
-    fn style_key_maps_to_colors_and_bold() {
-        assert_eq!(style_of(PLAIN), Style::default());
-        assert_eq!(style_of(1), Style::default().fg(Color::Red));
-        assert_eq!(
-            style_of(1 | 8),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-        );
     }
 
     #[test]
@@ -193,6 +160,22 @@ mod tests {
         }
         assert!(sb.len() <= 2);
         assert_eq!(sb.dropped(), 8);
+    }
+
+    #[test]
+    fn byte_budget_accounts_for_the_full_styled_cell_size() {
+        let cell_bytes = std::mem::size_of::<Cell>();
+        let mut sb = Scrollback::new(10, 3 * cell_bytes);
+        sb.push(Row {
+            cells: vec![Cell::new('x', PLAIN.fg(Color::Rgb(1, 2, 3)).bg(Color::Indexed(200))); 3],
+            at: 0,
+        });
+        assert_eq!(sb.bytes, 3 * cell_bytes);
+        sb.push(row("y"));
+        assert_eq!(sb.bytes, cell_bytes);
+        assert_eq!(sb.dropped(), 1);
+        sb.clear();
+        assert_eq!(sb.bytes, 0);
     }
 
     #[test]

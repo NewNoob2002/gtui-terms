@@ -1,6 +1,6 @@
 # GTUI — Rust TUI 串口调试终端：需求分析与实施计划
 
-> 状态：规划稿，未开始编码。名称 **GTUI**，许可证 **MIT**，目标平台 **Windows 10+ / Linux**。
+> 状态：已实现并持续补齐，软件验证见 §10，硬件与跨平台验收仍待执行。名称 **GTUI**，许可证 **MIT**，目标平台 **Windows 10+ / Linux**。
 > 参考实现：`espressif/esp-idf-monitor`（Python，Apache-2.0）、`hucker/termapy`（Python/Textual，MIT）。本文与后续代码均为独立实现，不复制源文件。
 
 ## 1. 结论
@@ -335,9 +335,9 @@ graph LR
 | FR-03 | 完成 | 打开即复位，`--no-reset` 关闭 |
 | FR-04 | 完成 | 500ms 重连循环，状态栏 `retrying` |
 | FR-05 | 完成 | 50k 行/8MB 环形缓冲，PageUp/PageDown，`Ctrl+Home`/`Ctrl+End` |
-| FR-06 | 部分 | SGR 16 色 + bold + `ESC[K/D/C/G`；`38;5;n`、`38;2;r;g;b` 未解析，直接忽略（固件日志极少使用） |
+| FR-06 | 完成 | SGR 16/256/RGB 前景与背景、bold/underline 及独立复位；`ESC[K/D/C/G`；TestBackend 验证样式与搜索高亮叠加 |
 | FR-07 | 完成 | `\r` 覆写行，尾部空格裁剪 |
-| FR-08 | 部分 | 非法字节以 U+FFFD 呈现，未做转义显示与计数告警 |
+| FR-08 | 完成 | 非法 UTF-8 逐字节显示为 `\xNN`，状态栏累计计数；跨包有效 UTF-8 和非法前缀后的 ASCII/换行/控制序列不丢 |
 | FR-09 | 完成 | 行式输入 + 光标编辑 + 持久化历史 |
 | FR-10 | 完成 | `/eol` 四模式，发送不打印本地回显 |
 | FR-11 | 完成 | RAW 直通，按键映射见 README |
@@ -348,13 +348,25 @@ graph LR
 | FR-16 | 完成 | panic 扫描 + 地址窗口过滤 + addr2line；无真机数据 |
 | FR-17 | 完成 | `--elf`/配置/`build/*.elf` 自动发现 + SHA256 比对告警 |
 | FR-18 | 完成 | `F7` 子串搜索（不区分大小写，命中内联反色），`re:` 前缀走正则（整段命中范围高亮）；`/filter i,w,e` 级别过滤 |
-| FR-19 | 部分 | HEX 收视图 + `/hex` 发送；无独立 HEX 输入框 |
+| FR-19 | 完成 | F8 HEX 收视图 + `/hex` 十六进制发送，满足文本/HEX 切换与字节顺序验收 |
 | FR-20 | 完成 | `/repeat`、`/stop` |
-| FR-21 | 部分 | 宏可读可触发；不写回配置文件 |
-| FR-22 | 部分 | 区间文本落盘；未产出 esp-coredump 直接可读的二进制 |
+| FR-21 | 完成 | 配置载入/快捷触发，`/macro <name> <key> <text>` 保存到显式或项目配置并立即生效；同名覆盖 |
+| FR-22 | 完成 | 原始文本保留 + base64 解码生成 `.bin`，与日志同目录；非法/不完整数据报错并保留原文；真实 esp-coredump 消费待硬件验收 |
 | FR-23 | 完成 | 手动/正则触发，释放端口后执行并重连 |
 | FR-24 | 完成 | 三层合并，命令行 > 项目 > 全局 |
 | FR-25 | 完成 | `--demo`、`--demo --panic` |
 | FR-26 | 完成 | `--pipe` 走完整串口参数 |
 | FR-27 | 不做 | 由外部钩子覆盖 |
 | FR-28 | 不做 | — |
+
+### 剩余功能补齐与分批提交（2026-11-12）
+
+- 已完成代码基线、文档、CI 三批提交：`a19f7fa`、`70ec3e3`、`058472f`。基线验证为 64 个测试、fmt、Clippy、构建和 ConPTY demo 正常退出。
+- 补齐 FR-06、FR-08、FR-21、FR-22；终端 Cell 直接存储 ratatui Style，滚动缓冲按实际 Cell 大小执行 8 MiB 上限，搜索高亮保留 bold/underline。
+- 宏写回先校验、序列化并同步同目录临时文件，再替换目标配置；失败不修改当前快捷绑定。保留无关 TOML 值，格式和注释会被规范化。
+- coredump 使用完整起止标记，保留原始 `.txt`，按 base64 原样恢复 `.bin`；文件使用独占创建避免覆盖，损坏或截断输入不会伪装成有效二进制。
+- CI 触发分支补充 `master`，与当前工作分支一致，同时保留 `main`。
+- 验证：81 个测试通过；Clippy `--all-targets -- -D warnings` 无告警；release 构建通过。临时集成冒烟验证串口事件 → ANSI/非法字节 → UI 样式与状态，以及分包 coredump → 与日志同目录二进制，字节为 `00 01 02 FF`。
+- ConPTY 实测 release `--demo --panic --config`：`/macro smoke f9 hello world` 写回配置且保留已有宏、hook 和设备字段；F9 输出 `hello world`、状态栏 `tx 13 B | macro smoke`，Ctrl+Q 正常退出。
+- 待外部条件验收：真实 ESP32 复位/bootloader/拔插/921600 长跑、Xtensa/RISC-V 真实 ELF、真实 coredump 工具消费、Linux 与 GitHub CI 运行。当前机器仅执行 Windows GNU 工具链验证。
+

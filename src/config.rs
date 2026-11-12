@@ -50,7 +50,7 @@ pub struct MacroDef {
     pub key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Macro {
     pub name: String,
     pub text: String,
@@ -79,7 +79,10 @@ impl Config {
         self.stop_bits = other.stop_bits.or(self.stop_bits);
         self.flow = other.flow.or_else(|| self.flow.take());
         self.no_reset = other.no_reset.or(self.no_reset);
-        self.macros.extend(other.macros);
+        for entry in other.macros {
+            self.macros.retain(|existing| existing.name != entry.name);
+            self.macros.push(entry);
+        }
         self.hooks.extend(other.hooks);
     }
 }
@@ -170,6 +173,68 @@ fn compile_macros(defs: &[MacroDef], warnings: &mut Vec<String>) -> Vec<Macro> {
     out
 }
 
+/// Saves a named macro while preserving other TOML values, then returns its active binding.
+pub fn save_macro(path: &Path, name: &str, spec: &str, text: &str) -> Result<Macro, String> {
+    let (key, mods) = parse_key(spec)
+        .ok_or_else(|| format!("unsupported key {spec:?} (use f9-f12 or alt+<char>)"))?;
+    let mut document = match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            toml::from_str::<Config>(&contents).map_err(|err| format!("{path:?}: {err}"))?;
+            toml::from_str::<toml::Table>(&contents).map_err(|err| format!("{path:?}: {err}"))?
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(err) => return Err(format!("{path:?}: {err}")),
+    };
+    let definitions = document
+        .entry("macros")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| format!("{path:?}: macros must be an array of tables"))?;
+    let mut definition = definitions
+        .iter()
+        .rev()
+        .find(|entry| entry.get("name").and_then(toml::Value::as_str) == Some(name))
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    for (field, value) in [("name", name), ("key", spec), ("text", text)] {
+        definition.insert(field.to_string(), toml::Value::String(value.to_string()));
+    }
+    definitions.retain(|entry| entry.get("name").and_then(toml::Value::as_str) != Some(name));
+    definitions.push(toml::Value::Table(definition));
+    let serialized = toml::to_string_pretty(&document)
+        .map_err(|err| format!("{path:?}: cannot serialize config: {err}"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{path:?}: expected a config file path"))?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|err| format!("{path:?}: cannot create temporary config: {err}"))?;
+    let result = (|| {
+        std::io::Write::write_all(&mut file, serialized.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("{path:?}: cannot save config: {err}"));
+    }
+    Ok(Macro {
+        name: name.to_string(),
+        text: text.to_string(),
+        key,
+        mods,
+    })
+}
+
 pub fn parse_key(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
     let spec = spec.trim();
     if let Some((head, rest)) = spec.split_once('+') {
@@ -223,6 +288,81 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn saving_macros_roundtrips_unrelated_values_and_updates_by_name() {
+        let dir = std::env::temp_dir().join(format!("gtui-save-macro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write(
+            &dir,
+            "config.toml",
+            r#"baud = 921600
+custom = { enabled = true, labels = ["one", "two"] }
+
+[[hooks]]
+name = "flash"
+command = "echo flash"
+trigger = "ready"
+extra = "keep hook metadata"
+
+[[macros]]
+name = "ping"
+key = "f9"
+text = "old"
+extra = "keep macro metadata"
+
+[[macros]]
+name = "other"
+key = "f10"
+text = "untouched"
+"#,
+        );
+        let before: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let saved = save_macro(&path, "ping", "alt+p", "hello \"world\"\nnext").unwrap();
+        assert_eq!(saved.key, KeyCode::Char('p'));
+        assert_eq!(saved.mods, KeyModifiers::ALT);
+        let after: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for field in ["baud", "custom", "hooks"] {
+            assert_eq!(after[field], before[field]);
+        }
+        let entries = after["macros"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&before["macros"].as_array().unwrap()[1]));
+        let ping = entries
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some("ping"))
+            .unwrap();
+        assert_eq!(ping["extra"].as_str(), Some("keep macro metadata"));
+        assert_eq!(ping["text"].as_str(), Some("hello \"world\"\nnext"));
+        save_macro(&path, "ping", "f12", "updated").unwrap();
+        let mut config = Config::default();
+        let mut warnings = Vec::new();
+        merge_file(&mut config, &path, true, &mut warnings).unwrap();
+        let macros = compile_macros(&config.macros, &mut warnings);
+        assert_eq!(macros.len(), 2);
+        let ping = macros.iter().find(|entry| entry.name == "ping").unwrap();
+        assert_eq!(ping.key, KeyCode::F(12));
+        assert_eq!(ping.text, "updated");
+        assert!(warnings.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn project_macros_replace_global_macros_with_the_same_name() {
+        let mut config = Config::default();
+        for contents in [
+            "[[macros]]\nname = 'ping'\nkey = 'f9'\ntext = 'global'\n",
+            "[[macros]]\nname = 'ping'\nkey = 'f12'\ntext = 'project'\n",
+        ] {
+            config.merge(toml::from_str(contents).unwrap());
+        }
+        let mut warnings = Vec::new();
+        let macros = compile_macros(&config.macros, &mut warnings);
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].text, "project");
+        assert_eq!(macros[0].key, KeyCode::F(12));
+        assert!(warnings.is_empty());
     }
 
     #[test]
