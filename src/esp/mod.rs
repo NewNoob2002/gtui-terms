@@ -2,4 +2,5 @@
 
 pub mod coredump;
 pub mod elf;
+pub mod log;
 pub mod panic;

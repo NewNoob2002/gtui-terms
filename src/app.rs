@@ -24,6 +24,20 @@ pub const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT: usize = 4096;
 const HISTORY_MAX: usize = 200;
 pub const RAW_CAP: usize = 1024 * 1024;
+const PACKET_CAP: usize = 2000;
+
+pub struct Packet {
+    pub at: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+pub struct PacketCache {
+    pub rows: Vec<Line<'static>>,
+    pub starts: Vec<usize>,
+    pub key: Option<(u64, u16, bool, bool, View)>,
+    pub dropped: usize,
+}
 
 pub struct Repeat {
     pub payload: String,
@@ -94,6 +108,9 @@ pub enum Popup {
     Actions,
     Esp,
     Elf,
+    Save,
+    Flash,
+    ConfirmTool,
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +123,8 @@ pub enum Hit {
     Menu(usize),
     Close,
     ElfApply,
+    DialogApply,
+    TxOutput,
 }
 
 pub struct App {
@@ -126,6 +145,23 @@ pub struct App {
     pub quit: bool,
     pub dirty: bool,
     pub show_timestamps: bool,
+    pub show_packets: bool,
+    pub scroll_locked: bool,
+    pub rx_packets: VecDeque<Packet>,
+    pub tx_packets: VecDeque<Packet>,
+    pub rx_packet_dropped: usize,
+    rx_packet_bytes: usize,
+    tx_packet_bytes: usize,
+    pub tx_packet_dropped: usize,
+    pub tx_cache: PacketCache,
+    pub tx_scroll_back: usize,
+    pub pending_writes: usize,
+    pub pending_controls: usize,
+    pub last_rx_at: u64,
+    session: Option<crate::session::Session>,
+    session_error: String,
+    pub record_output: Option<Box<dyn std::io::Write + Send>>,
+    pub record_output_error: Option<std::io::Error>,
     pub demo: bool,
     pub reconnecting: bool,
     pub version: u64,
@@ -134,6 +170,7 @@ pub struct App {
     pub cache_width: u16,
     pub cache_version: u64,
     pub starts: Vec<usize>,
+    pub cache_dropped: usize,
     pub total_rows: usize,
     pub scroll_back: usize,
     pub view_height: u16,
@@ -152,6 +189,8 @@ pub struct App {
     pub popup_selected: usize,
     pub popup_rect: Rect,
     pub elf_input: String,
+    pub prompt_input: String,
+    pub pending_tool: Option<crate::esptool::Invocation>,
     pub help_scroll: usize,
     pub help_max_scroll: usize,
     pub help_height: usize,
@@ -196,6 +235,10 @@ impl App {
         hooks: Vec<crate::config::Hook>,
     ) -> Self {
         let (tx, rx) = channel();
+        let (session, session_error) = match crate::session::Session::new() {
+            Ok(session) => (Some(session), String::new()),
+            Err(err) => (None, format!("session capture unavailable: {err}")),
+        };
         Self {
             mode: Mode::Picker,
             view: View::Text,
@@ -206,7 +249,7 @@ impl App {
             settings: serial::Settings::new(baud),
             auto_reset: true,
             label: String::new(),
-            status: String::new(),
+            status: session_error.clone(),
             scrollback: Scrollback::new(SCROLLBACK_ROWS, SCROLLBACK_BYTES),
             assembler: Assembler::new(),
             input: Vec::new(),
@@ -214,6 +257,23 @@ impl App {
             quit: false,
             dirty: true,
             show_timestamps,
+            show_packets: false,
+            scroll_locked: false,
+            rx_packets: VecDeque::new(),
+            tx_packets: VecDeque::new(),
+            rx_packet_dropped: 0,
+            rx_packet_bytes: 0,
+            tx_packet_bytes: 0,
+            tx_packet_dropped: 0,
+            tx_cache: PacketCache::default(),
+            tx_scroll_back: 0,
+            pending_writes: 0,
+            pending_controls: 0,
+            last_rx_at: 0,
+            session,
+            session_error,
+            record_output: None,
+            record_output_error: None,
             demo: false,
             reconnecting: false,
             version: 1,
@@ -223,6 +283,7 @@ impl App {
             cache_version: 0,
             starts: Vec::new(),
             total_rows: 0,
+            cache_dropped: 0,
             scroll_back: 0,
             view_height: 1,
             search_query: None,
@@ -240,6 +301,8 @@ impl App {
             popup_selected: 0,
             popup_rect: Rect::default(),
             elf_input: String::new(),
+            prompt_input: String::new(),
+            pending_tool: None,
             help_scroll: 0,
             help_max_scroll: 0,
             help_height: 1,
@@ -402,22 +465,44 @@ impl App {
     }
 
     fn on_hook_done(&mut self, name: String, ok: bool, output: String) {
+        let esptool = name == "esptool";
+        if !output.is_empty() {
+            self.record_session(now_ms(), "TOOL", output.as_bytes());
+        }
         let at = now_ms();
         self.push_text(
-            &format!("[hook {name}] exit {}", if ok { "0" } else { "non-zero" }),
-            Style::new().fg(Color::Red),
+            &format!(
+                "[{}] exit {}",
+                if esptool {
+                    "esptool".to_string()
+                } else {
+                    format!("hook {name}")
+                },
+                if ok { "0" } else { "non-zero" }
+            ),
+            Style::new().fg(if ok { Color::Green } else { Color::Red }),
             at,
         );
         for line in output.lines().take(40) {
             self.push_text(&format!("[hook {name}] {line}"), PLAIN, at);
         }
         self.hook_running = None;
-        self.status = format!("hook {} finished (exit {})", name, if ok { 0 } else { 1 });
-        self.hook_last.insert(name, std::time::Instant::now());
+        self.hook_last
+            .insert(name.clone(), std::time::Instant::now());
         if let Some((port, kind)) = self.reopen_after_hook.take() {
             self.push_text(&format!("[hook] reopening {port}"), PLAIN, at);
+            let auto_reset = self.auto_reset;
+            if esptool {
+                self.auto_reset = false;
+            }
             self.connect_with(&port, kind);
+            self.auto_reset = auto_reset;
         }
+        self.status = format!(
+            "{} finished (exit {})",
+            if esptool { "esptool" } else { &name },
+            if ok { 0 } else { 1 }
+        );
         self.version += 1;
         self.dirty = true;
     }
@@ -530,9 +615,57 @@ impl App {
         self.scrollback.push(Row { cells, at });
     }
 
+    fn record_session(&mut self, at: u64, direction: &str, bytes: &[u8]) {
+        if let Some(output) = &mut self.record_output
+            && let Err(err) = crate::session::write_record(output, at, direction, bytes)
+                .and_then(|()| output.flush())
+        {
+            self.record_output_error = Some(err);
+            self.quit = true;
+        }
+        if !self.session_error.is_empty() {
+            return;
+        }
+        if let Some(session) = &mut self.session
+            && let Err(err) = session.record(at, direction, bytes)
+        {
+            self.session_error = format!("session capture incomplete: {err}");
+            self.status = self.session_error.clone();
+        }
+    }
+
+    pub fn save_session(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if !self.session_error.is_empty() {
+            return Err(self.session_error.clone());
+        }
+        self.session
+            .as_mut()
+            .ok_or("session capture unavailable")?
+            .export(path)
+            .map_err(|err| format!("cannot save {}: {err}", path.display()))?;
+        self.status = format!("session saved to {}", path.display());
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn record_tx(&mut self, bytes: Vec<u8>) {
+        let at = now_ms();
+        self.record_session(at, "TX", &bytes);
+        self.tx_bytes += bytes.len() as u64;
+        self.tx_packet_dropped += retain_packet(
+            &mut self.tx_packets,
+            &mut self.tx_packet_bytes,
+            Packet { at, bytes },
+        );
+        self.dirty = true;
+    }
+
     pub fn on_event(&mut self, event: Event) {
         match event {
             Event::Data(bytes) => {
+                let at = now_ms();
+                self.last_rx_at = at;
+                self.record_session(at, "RX", &bytes);
                 if let Some(log) = &mut self.log {
                     log.write(&bytes);
                     if self.last_flush.elapsed().as_millis() >= 500 {
@@ -547,12 +680,20 @@ impl App {
                     self.raw.pop_front();
                 }
                 self.assembler.feed(&bytes);
-                let at = now_ms();
                 let rows: Vec<Row> = self
                     .assembler
                     .take()
                     .into_iter()
-                    .map(|cells| Row { cells, at })
+                    .map(|mut cells| {
+                        if let Some(color) = crate::esp::log::color(&cells) {
+                            for cell in &mut cells {
+                                if cell.style.fg.is_none() {
+                                    cell.style.fg = Some(color);
+                                }
+                            }
+                        }
+                        Row { cells, at }
+                    })
                     .collect();
                 self.check_triggers(&rows);
                 for row in rows {
@@ -561,6 +702,29 @@ impl App {
                     }
                 }
                 self.scan_esp(&bytes);
+                self.rx_packet_dropped += retain_packet(
+                    &mut self.rx_packets,
+                    &mut self.rx_packet_bytes,
+                    Packet { at, bytes },
+                );
+                self.version += 1;
+                self.dirty = true;
+            }
+            Event::Written(bytes) => {
+                self.pending_writes = self.pending_writes.saturating_sub(1);
+                self.record_tx(bytes);
+            }
+            Event::WriteFailed(error) => {
+                self.pending_writes = self.pending_writes.saturating_sub(1);
+                self.status = format!("write failed: {error}");
+                self.dirty = true;
+            }
+            Event::ToolOutput(text) => {
+                let at = now_ms();
+                self.record_session(at, "TOOL", text.as_bytes());
+                for line in text.lines() {
+                    self.push_text(&format!("[esptool] {line}"), PLAIN, at);
+                }
                 self.version += 1;
                 self.dirty = true;
             }
@@ -579,8 +743,12 @@ impl App {
                 self.status = "reconnecting…".to_string();
                 self.dirty = true;
             }
-            Event::Notice(text) => {
-                self.status = text;
+            Event::ControlDone(text) => {
+                self.pending_controls = self.pending_controls.saturating_sub(1);
+                self.record_session(now_ms(), "STATE", text.as_bytes());
+                if self.session_error.is_empty() {
+                    self.status = text;
+                }
                 self.dirty = true;
             }
             Event::HookDone { name, ok, output } => {
@@ -677,10 +845,27 @@ impl App {
                 self.help = true;
                 self.help_scroll = 0;
             }
-            5 => self.quit = true,
+            5 => self.request_quit(),
+            6 => self.open_popup(Popup::Save),
+            7 => self.toggle_lock(),
+            8 => self.toggle_packets(),
             _ => {}
         }
         self.dirty = true;
+    }
+
+    fn request_quit(&mut self) {
+        if self.hook_running.as_deref() == Some("esptool")
+            || self.pending_writes > 0
+            || self.pending_controls > 0
+        {
+            self.status =
+                "Serial commands or esptool are running; wait for completion before quitting"
+                    .to_string();
+            self.dirty = true;
+        } else {
+            self.quit = true;
+        }
     }
 
     fn open_popup(&mut self, popup: Popup) {
@@ -692,6 +877,11 @@ impl App {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
+        }
+        if popup == Popup::Save {
+            self.prompt_input = format!("session-{}.log", now_ms());
+        } else if popup == Popup::Flash {
+            self.prompt_input.clear();
         }
         self.dirty = true;
     }
@@ -720,12 +910,23 @@ impl App {
                 format!("Input: {} (F2)", if self.raw_mode { "RAW" } else { "line" }),
                 "ESP-IDF tools".to_string(),
                 "Help (F1)".to_string(),
+                "Save current session... (Ctrl+S)".to_string(),
+                format!(
+                    "Scroll lock: {} (Ctrl+B)",
+                    if self.scroll_locked { "on" } else { "off" }
+                ),
+                format!("Packets: {}", if self.show_packets { "on" } else { "off" }),
             ],
             Some(Popup::Esp) => {
                 let mut items = vec![
                     "Reset device (F5)".to_string(),
                     "Enter bootloader (F6)".to_string(),
                     "Load ELF symbols...".to_string(),
+                    "Chip information (esptool)".to_string(),
+                    "Flash information (esptool)".to_string(),
+                    "Read MAC (esptool)".to_string(),
+                    "Erase entire Flash...".to_string(),
+                    "Flash firmware images...".to_string(),
                 ];
                 items.extend(
                     self.hooks
@@ -745,12 +946,38 @@ impl App {
             View::Text
         };
         self.scroll_back = 0;
+        self.total_rows = 0;
+        self.cache.clear();
+        self.starts.clear();
+        self.cache_width = 0;
         self.version += 1;
     }
 
     fn toggle_timestamps(&mut self) {
         self.show_timestamps = !self.show_timestamps;
         self.version += 1;
+    }
+
+    fn toggle_lock(&mut self) {
+        self.scroll_locked = !self.scroll_locked;
+        if !self.scroll_locked {
+            self.scroll_back = 0;
+        }
+        if !self.scroll_locked {
+            self.tx_scroll_back = 0;
+        }
+        self.dirty = true;
+    }
+
+    fn toggle_packets(&mut self) {
+        self.show_packets = !self.show_packets;
+        self.scroll_back = 0;
+        self.total_rows = 0;
+        self.cache.clear();
+        self.starts.clear();
+        self.cache_width = 0;
+        self.version += 1;
+        self.dirty = true;
     }
 
     fn menu_action(&mut self, index: usize) {
@@ -789,16 +1016,24 @@ impl App {
                     self.help = true;
                     self.help_scroll = 0;
                 }
+                11 => self.open_popup(Popup::Save),
+                12 => self.toggle_lock(),
+                13 => self.toggle_packets(),
                 _ => {}
             },
             Some(Popup::Esp) => match index {
                 0 => self.queue_reset(false),
                 1 => self.queue_reset(true),
                 2 => self.open_popup(Popup::Elf),
+                3 => self.prepare_esptool(crate::esptool::Operation::ChipId, ""),
+                4 => self.prepare_esptool(crate::esptool::Operation::FlashId, ""),
+                5 => self.prepare_esptool(crate::esptool::Operation::ReadMac, ""),
+                6 => self.prepare_esptool(crate::esptool::Operation::EraseFlash, ""),
+                7 => self.open_popup(Popup::Flash),
                 _ => {
                     if let Some(name) = self
                         .hooks
-                        .get(index.saturating_sub(3))
+                        .get(index.saturating_sub(8))
                         .map(|hook| hook.name.clone())
                     {
                         self.run_hook(&name);
@@ -821,9 +1056,124 @@ impl App {
         }
     }
 
+    fn prepare_esptool(&mut self, operation: crate::esptool::Operation, arguments: &str) {
+        if self.demo || self.label.is_empty() {
+            self.status = "Select and connect a real serial port before using esptool".to_string();
+            return;
+        }
+        if self.hook_running.is_some() {
+            self.status = "Wait for the running tool before starting another".to_string();
+            return;
+        }
+        match crate::esptool::build(&self.label, self.settings.baud, operation, arguments) {
+            Ok(invocation) if operation.destructive() => {
+                self.pending_tool = Some(invocation);
+                self.open_popup(Popup::ConfirmTool);
+            }
+            Ok(invocation) => self.launch_esptool(invocation),
+            Err(err) => self.status = err,
+        }
+        self.dirty = true;
+    }
+
+    fn launch_esptool(&mut self, invocation: crate::esptool::Invocation) {
+        let reopen = if self.writes.is_some() {
+            Some((self.label.clone(), self.reset_kind))
+        } else {
+            None
+        };
+        self.shutdown_worker();
+        self.repeat = None;
+        self.status = format!("esptool running: {}", invocation.summary);
+        self.hook_running = Some("esptool".to_string());
+        self.reopen_after_hook = reopen;
+        self.popup = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let outcome = crate::esptool::run(&invocation, |text| {
+                let _ = tx.send(Event::ToolOutput(text));
+            });
+            let _ = tx.send(Event::HookDone {
+                name: "esptool".to_string(),
+                ok: outcome.ok,
+                output: outcome.text,
+            });
+        });
+        self.dirty = true;
+    }
+
+    fn apply_prompt(&mut self) {
+        match self.popup {
+            Some(Popup::Save) => {
+                let path = std::path::PathBuf::from(self.prompt_input.trim().trim_matches('"'));
+                match self.save_session(&path) {
+                    Ok(()) => self.popup = None,
+                    Err(err) => self.status = err,
+                }
+            }
+            Some(Popup::Flash) => self.prepare_esptool(
+                crate::esptool::Operation::WriteFlash,
+                &self.prompt_input.clone(),
+            ),
+            Some(Popup::ConfirmTool) => {
+                if self.hook_running.is_some() {
+                    self.status = "Wait for the running tool before confirming another".to_string();
+                    self.dirty = true;
+                    return;
+                }
+                if let Some(invocation) = self.pending_tool.take() {
+                    self.launch_esptool(invocation);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn popup_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
             self.popup = None;
+            self.pending_tool = None;
+            return;
+        }
+        if matches!(
+            self.popup,
+            Some(Popup::Save | Popup::Flash | Popup::ConfirmTool)
+        ) {
+            match key.code {
+                KeyCode::Enter => self.apply_prompt(),
+                KeyCode::Up if self.popup == Some(Popup::ConfirmTool) => {
+                    self.popup_selected = self.popup_selected.saturating_sub(1)
+                }
+                KeyCode::Down if self.popup == Some(Popup::ConfirmTool) => {
+                    self.popup_selected = self.popup_selected.saturating_add(1)
+                }
+                KeyCode::PageUp if self.popup == Some(Popup::ConfirmTool) => {
+                    self.popup_selected = self.popup_selected.saturating_sub(8)
+                }
+                KeyCode::PageDown if self.popup == Some(Popup::ConfirmTool) => {
+                    self.popup_selected = self.popup_selected.saturating_add(8)
+                }
+                KeyCode::Home if self.popup == Some(Popup::ConfirmTool) => self.popup_selected = 0,
+                KeyCode::End if self.popup == Some(Popup::ConfirmTool) => {
+                    self.popup_selected = usize::MAX
+                }
+                KeyCode::Backspace => {
+                    self.prompt_input.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.prompt_input.clear()
+                }
+                KeyCode::Char(ch)
+                    if self.popup != Some(Popup::ConfirmTool)
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && self.prompt_input.len() < MAX_INPUT =>
+                {
+                    self.prompt_input.push(ch)
+                }
+                _ => {}
+            }
             return;
         }
         if self.popup == Some(Popup::Elf) {
@@ -903,8 +1253,15 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => match hit {
                     Some(Hit::Menu(index)) => self.menu_action(index),
                     Some(Hit::ElfApply) => self.apply_elf_input(),
-                    Some(Hit::Close) => self.popup = None,
-                    _ if !self.popup_rect.contains(position) => self.popup = None,
+                    Some(Hit::DialogApply) => self.apply_prompt(),
+                    Some(Hit::Close) => {
+                        self.popup = None;
+                        self.pending_tool = None;
+                    }
+                    _ if !self.popup_rect.contains(position) => {
+                        self.popup = None;
+                        self.pending_tool = None;
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -922,7 +1279,7 @@ impl App {
                     self.selected = index;
                     self.open_settings(true);
                 }
-                Some(Hit::Output) => {
+                Some(Hit::Output | Hit::TxOutput) => {
                     self.focus = Focus::Output;
                     self.search_input = None;
                 }
@@ -941,6 +1298,12 @@ impl App {
             MouseEventKind::ScrollDown if matches!(hit, Some(Hit::Output)) => {
                 self.scroll_back = self.scroll_back.saturating_sub(3)
             }
+            MouseEventKind::ScrollUp if matches!(hit, Some(Hit::TxOutput)) => {
+                self.tx_scroll_back = self.tx_scroll_back.saturating_add(3)
+            }
+            MouseEventKind::ScrollDown if matches!(hit, Some(Hit::TxOutput)) => {
+                self.tx_scroll_back = self.tx_scroll_back.saturating_sub(3)
+            }
             _ => {}
         }
     }
@@ -948,7 +1311,7 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('q') {
-            self.quit = true;
+            self.request_quit();
             return;
         }
         self.dirty = true;
@@ -1015,6 +1378,14 @@ impl App {
                 self.toggle_hex();
                 return;
             }
+            KeyCode::ScrollLock | KeyCode::Char('b') if key.code == KeyCode::ScrollLock || ctrl => {
+                self.toggle_lock();
+                return;
+            }
+            KeyCode::Char('s') if ctrl => {
+                self.open_popup(Popup::Save);
+                return;
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 let backwards =
                     key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1039,10 +1410,10 @@ impl App {
         if self.focus == Focus::Toolbar {
             match key.code {
                 KeyCode::Left | KeyCode::Up => {
-                    self.toolbar_selected = (self.toolbar_selected + 5) % 6
+                    self.toolbar_selected = (self.toolbar_selected + 8) % 9
                 }
                 KeyCode::Right | KeyCode::Down => {
-                    self.toolbar_selected = (self.toolbar_selected + 1) % 6
+                    self.toolbar_selected = (self.toolbar_selected + 1) % 9
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.toolbar_action(self.toolbar_selected),
                 KeyCode::Esc => self.focus = Focus::Output,
@@ -1117,6 +1488,9 @@ impl App {
     fn open_search(&mut self) {
         if self.mode != Mode::Terminal || self.view == View::Hex {
             return;
+        }
+        if self.show_packets {
+            self.toggle_packets();
         }
         let seed = self.search_query.clone().unwrap_or_default();
         self.focus = Focus::Input;
@@ -1211,6 +1585,10 @@ impl App {
     }
 
     fn step_hit(&mut self, forward: bool) {
+        if self.show_packets {
+            self.open_search();
+            return;
+        }
         if self.hits.is_empty() {
             return;
         }
@@ -1330,6 +1708,8 @@ impl App {
 
     fn scroll_end(&mut self) {
         self.scroll_back = 0;
+        self.scroll_locked = false;
+        self.tx_scroll_back = 0;
         self.dirty = true;
     }
 
@@ -1404,6 +1784,21 @@ impl App {
     fn clear(&mut self) {
         self.scrollback.clear();
         self.assembler.reset();
+        self.rx_packets.clear();
+        self.tx_packets.clear();
+        self.rx_packet_bytes = 0;
+        self.tx_packet_bytes = 0;
+        self.tx_cache = PacketCache::default();
+        self.tx_scroll_back = 0;
+        self.raw.clear();
+        self.cache.clear();
+        self.starts.clear();
+        self.cache_dropped = if self.show_packets {
+            self.rx_packet_dropped
+        } else {
+            self.scrollback.dropped()
+        };
+        self.total_rows = 0;
         self.hits.clear();
         self.search_re = None;
         self.scroll_back = 0;
@@ -1422,13 +1817,7 @@ impl App {
             self.history.drain(..excess);
             self.save_history();
         }
-        if text.starts_with("//") {
-            self.send_payload(&text[1..]);
-        } else if text.starts_with('/') {
-            self.command(&text);
-        } else if !text.is_empty() {
-            self.send_payload(&text);
-        }
+        self.execute(&text);
         self.dirty = true;
     }
 
@@ -1448,12 +1837,12 @@ impl App {
                 if writes.send(serial::Command::Write(bytes)).is_err() {
                     self.status = "write channel closed".to_string();
                 } else {
-                    self.tx_bytes += len as u64;
+                    self.pending_writes += 1;
                 }
             }
             None if self.demo => {
                 self.status = format!("{len} byte(s) sent to demo device");
-                self.tx_bytes += len as u64;
+                self.record_tx(bytes);
             }
             None => self.status = "no port open".to_string(),
         }
@@ -1486,6 +1875,7 @@ impl App {
                 if writes.send(command).is_err() {
                     self.status = "write channel closed".to_string();
                 } else {
+                    self.pending_controls += 1;
                     self.status = if into_bootloader {
                         "entering bootloader…".to_string()
                     } else {
@@ -1510,6 +1900,9 @@ impl App {
             Some(writes) => {
                 if writes.send(serial::Command::Sequence(steps)).is_err() {
                     self.status = "write channel closed".to_string();
+                } else {
+                    self.pending_controls += 1;
+                    self.status = "running custom sequence…".to_string();
                 }
             }
             None if self.demo => self.status = "demo: sequence ignored".to_string(),
@@ -1518,8 +1911,89 @@ impl App {
         self.dirty = true;
     }
 
+    pub fn execute(&mut self, text: &str) {
+        if text.starts_with("//") {
+            self.send_payload(&text[1..]);
+        } else if text.starts_with('/') {
+            self.command(text);
+        } else if !text.is_empty() {
+            self.send_payload(text);
+        }
+        self.dirty = true;
+    }
+
     fn command(&mut self, text: &str) {
         let rest = text.trim_start_matches('/').trim();
+        match rest {
+            "save" => {
+                let path = self
+                    .coredump_directory()
+                    .join(format!("gtui-session-{}.log", now_ms()));
+                if let Err(err) = self.save_session(&path) {
+                    self.status = err;
+                }
+                return;
+            }
+            "lock" | "lock on" | "lock off" => {
+                if rest == "lock" || self.scroll_locked != rest.ends_with("on") {
+                    self.toggle_lock();
+                }
+                return;
+            }
+            "timestamps" | "timestamps on" | "timestamps off" => {
+                if rest == "timestamps" || self.show_timestamps != rest.ends_with("on") {
+                    self.toggle_timestamps();
+                }
+                return;
+            }
+            "packets" | "packets on" | "packets off" => {
+                if rest == "packets" || self.show_packets != rest.ends_with("on") {
+                    self.toggle_packets();
+                }
+                return;
+            }
+            "confirm" => {
+                if self.popup == Some(Popup::ConfirmTool) {
+                    self.apply_prompt();
+                } else {
+                    self.status = "No pending ESP operation to confirm".to_string();
+                }
+                return;
+            }
+            "cancel" => {
+                self.pending_tool = None;
+                self.popup = None;
+                return;
+            }
+            "quit" => {
+                self.request_quit();
+                return;
+            }
+            _ => {}
+        }
+        if let Some(path) = rest.strip_prefix("save ") {
+            if let Err(err) = self.save_session(std::path::Path::new(path.trim().trim_matches('"')))
+            {
+                self.status = err;
+            }
+            return;
+        }
+        if let Some(args) = rest.strip_prefix("esp ") {
+            let (operation, arguments) = args.split_once(' ').unwrap_or((args, ""));
+            let operation = match operation {
+                "chip-id" => crate::esptool::Operation::ChipId,
+                "flash-id" => crate::esptool::Operation::FlashId,
+                "read-mac" => crate::esptool::Operation::ReadMac,
+                "erase-flash" => crate::esptool::Operation::EraseFlash,
+                "write-flash" => crate::esptool::Operation::WriteFlash,
+                _ => {
+                    self.status = "ESP commands: chip-id, flash-id, read-mac, erase-flash, write-flash <offset> <file> ...".to_string();
+                    return;
+                }
+            };
+            self.prepare_esptool(operation, arguments);
+            return;
+        }
         match rest {
             "help" => {
                 self.help = true;
@@ -1618,10 +2092,7 @@ impl App {
         }
         if let Some(arg) = rest.strip_prefix("seq ") {
             match crate::serial::reset::parse_steps(arg) {
-                Ok(steps) => {
-                    self.queue_sequence(steps);
-                    self.status = format!("custom sequence {}", arg.trim());
-                }
+                Ok(steps) => self.queue_sequence(steps),
                 Err(err) => self.status = format!("sequence: {err}"),
             }
             return;
@@ -1748,6 +2219,10 @@ impl App {
         self.dirty = true;
     }
 
+    pub fn finish(&mut self) {
+        self.shutdown_worker();
+    }
+
     fn shutdown_worker(&mut self) {
         if let Some(worker) = self.worker.take() {
             self.stop.store(true, Ordering::Relaxed);
@@ -1756,10 +2231,18 @@ impl App {
         self.writes = None;
         let mut hook_done = None;
         while let Ok(event) = self.rx.try_recv() {
-            if matches!(event, Event::HookDone { .. }) {
-                hook_done = Some(event);
+            match event {
+                Event::HookDone { .. } => hook_done = Some(event),
+                Event::Written(_)
+                | Event::WriteFailed(_)
+                | Event::ControlDone(_)
+                | Event::ToolOutput(_) => self.on_event(event),
+                Event::Data(bytes) => self.record_session(now_ms(), "RX", &bytes),
+                _ => {}
             }
         }
+        self.pending_writes = 0;
+        self.pending_controls = 0;
         if let Some(event) = hook_done {
             let _ = self.tx.send(event);
         }
@@ -1781,7 +2264,7 @@ impl Drop for App {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -1853,6 +2336,18 @@ fn raw_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     })
 }
 
+fn retain_packet(packets: &mut VecDeque<Packet>, size: &mut usize, packet: Packet) -> usize {
+    *size += packet.bytes.len();
+    packets.push_back(packet);
+    let mut removed = 0;
+    while packets.len() > PACKET_CAP || *size > RAW_CAP {
+        if let Some(old) = packets.pop_front() {
+            *size -= old.bytes.len();
+            removed += 1;
+        }
+    }
+    removed
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1871,6 +2366,194 @@ mod tests {
         let mut app = App::new(115200, Vec::new(), None, false, Vec::new(), Vec::new());
         app.mode = Mode::Terminal;
         app
+    }
+
+    fn capture_output(app: &mut App) -> Arc<std::sync::Mutex<Vec<u8>>> {
+        struct Output(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        app.record_output = Some(Box::new(Output(Arc::clone(&output))));
+        output
+    }
+
+    #[test]
+    fn serial_controls_block_quit_until_success_or_failure_is_reported() {
+        let mut app = app();
+        let output = capture_output(&mut app);
+        let (writes, commands) = channel();
+        app.writes = Some(writes);
+        app.execute("/reset");
+        app.execute("/boot");
+        app.execute("/seq D0");
+        assert_eq!(app.pending_controls, 3);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            serial::Command::Reset {
+                into_bootloader: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            serial::Command::Reset {
+                into_bootloader: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            serial::Command::Sequence(_)
+        ));
+        app.execute("/quit");
+        assert!(!app.quit);
+        app.on_event(Event::Written(Vec::new()));
+        assert_eq!(app.pending_controls, 3);
+        for text in [
+            "chip reset",
+            "entered bootloader",
+            "sequence failed: disconnected",
+        ] {
+            app.on_event(Event::ControlDone(text.to_string()));
+        }
+        assert_eq!(app.pending_controls, 0);
+        app.on_event(Event::Reconnecting);
+        let captured = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(captured.matches("direction=\"STATE\"").count(), 3);
+        assert!(captured.contains("chip reset"));
+        assert!(captured.contains("entered bootloader"));
+        assert!(captured.contains("sequence failed: disconnected"));
+        app.execute("/quit");
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn closed_control_channel_never_leaves_pending_work() {
+        let mut app = app();
+        let (writes, commands) = channel();
+        app.writes = Some(writes);
+        drop(commands);
+        for command in ["/reset", "/boot", "/seq D0"] {
+            app.execute(command);
+            assert_eq!(app.pending_controls, 0);
+            assert_eq!(app.status, "write channel closed");
+        }
+    }
+
+    #[test]
+    fn shutdown_routes_queued_tool_output_and_control_completion_to_capture() {
+        let mut app = app();
+        let output = capture_output(&mut app);
+        let (writes, _commands) = channel();
+        app.writes = Some(writes);
+        app.execute("/reset");
+        app.execute("/hex 41");
+        app.tx
+            .send(Event::ControlDone("chip reset".to_string()))
+            .unwrap();
+        app.tx.send(Event::Written(b"A".to_vec())).unwrap();
+        app.tx
+            .send(Event::ToolOutput("queued output\n".to_string()))
+            .unwrap();
+        app.shutdown_worker();
+        assert_eq!(app.pending_controls, 0);
+        assert_eq!(app.pending_writes, 0);
+        assert_eq!(app.tx_bytes, 1);
+        let captured = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(captured.contains("direction=\"TOOL\""));
+        assert!(captured.contains("queued output"));
+        assert!(captured.contains("chip reset"));
+        let path = std::env::temp_dir().join(format!(
+            "gtui-shutdown-session-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        app.save_session(&path).unwrap();
+        let captured = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(captured.contains("direction=\"TOOL\""));
+        assert!(captured.contains("queued output"));
+    }
+
+    #[test]
+    fn session_retains_exact_rx_and_only_confirmed_tx_after_clear() {
+        let mut app = app();
+        let (writes, received) = channel();
+        app.writes = Some(writes);
+        app.execute("/hex 41 00 ff");
+        assert_eq!(app.pending_writes, 1);
+        assert_eq!(app.tx_bytes, 0);
+        assert!(app.tx_packets.is_empty());
+        let serial::Command::Write(bytes) = received.try_recv().unwrap() else {
+            panic!("expected write");
+        };
+        assert_eq!(bytes, [0x41, 0, 0xff]);
+        app.on_event(Event::Written(bytes));
+        assert_eq!(app.pending_writes, 0);
+        assert_eq!(app.tx_bytes, 3);
+        app.on_event(Event::Data(b"device\n".to_vec()));
+        let diagnostics: String = (0..60).map(|n| format!("build-failure-{n}\n")).collect();
+        app.on_hook_done("build".to_string(), false, diagnostics);
+        app.clear();
+        assert!(app.tx_packets.is_empty() && app.rx_packets.is_empty() && app.raw.is_empty());
+        let path = std::env::temp_dir().join(format!(
+            "gtui-app-session-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        app.save_session(&path).unwrap();
+        let captured = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(captured.contains("direction=\"TX\" length=3 hex=\"4100ff\""));
+        assert!(captured.contains("direction=\"RX\" length=7 hex=\"6465766963650a\""));
+        assert!(captured.contains("direction=\"TOOL\""));
+        assert!(captured.contains("build-failure-59\\n"));
+    }
+
+    #[test]
+    fn failed_write_is_not_counted_or_displayed_and_destructive_tools_wait_for_confirmation() {
+        let mut app = app();
+        let (writes, _received) = channel();
+        app.writes = Some(writes);
+        app.execute("/hex ff");
+        app.on_event(Event::WriteFailed("disconnected".into()));
+        assert_eq!(app.pending_writes, 0);
+        assert_eq!(app.tx_bytes, 0);
+        assert!(app.tx_packets.is_empty());
+        app.label = "COM-test".to_string();
+        app.execute("/esp erase-flash");
+        assert!(app.popup == Some(Popup::ConfirmTool));
+        assert!(
+            app.pending_tool
+                .as_ref()
+                .unwrap()
+                .summary
+                .contains("COM-test")
+        );
+        assert!(app.active_hook().is_none());
+        app.hook_running = Some("build".to_string());
+        app.execute("/confirm");
+        assert_eq!(app.active_hook(), Some("build"));
+        assert!(app.pending_tool.is_some());
+        assert!(app.reopen_after_hook.is_none());
+        app.hook_running = None;
+        app.execute("/cancel");
+        assert!(app.pending_tool.is_none() && app.popup.is_none());
+        assert!(app.active_hook().is_none());
     }
 
     #[test]

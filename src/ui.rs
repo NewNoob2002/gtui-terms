@@ -1,10 +1,10 @@
 use chrono::{Local, TimeZone};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Eol, Focus, Hit, Mode, Popup, View};
@@ -58,6 +58,17 @@ fn draw_toolbar(frame: &mut Frame, app: &mut App) -> u16 {
         "ESP",
         "Help F1",
         "Quit ^Q",
+        "Save ^S",
+        if app.scroll_locked {
+            "Lock:on ^B"
+        } else {
+            "Lock:off ^B"
+        },
+        if app.show_packets {
+            "Packets:on"
+        } else {
+            "Packets:off"
+        },
     ];
     let mut start = 0;
     if app.focus == Focus::Toolbar {
@@ -166,20 +177,8 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
     .split(area);
 
     app.view_height = chunks[0].height.max(1);
-    app.hits_ui.push((chunks[0], Hit::Output));
     app.hits_ui.push((chunks[2], Hit::Input));
-    match app.view {
-        View::Hex => draw_hex(frame, app, chunks[0]),
-        View::Text => {
-            let height = usize::from(app.view_height);
-            let scroll_back = app.scroll_back;
-            let rows = cached_rows(app, chunks[0].width.max(1));
-            let max_top = rows.len().saturating_sub(height);
-            let top = max_top.saturating_sub(scroll_back.min(max_top));
-            let scroll = u16::try_from(top).unwrap_or(u16::MAX);
-            frame.render_widget(Paragraph::new(rows).scroll((scroll, 0)), chunks[0]);
-        }
-    }
+    draw_streams(frame, app, chunks[0]);
 
     let mut status = format!(
         " {} | {} | {} | {} lines",
@@ -190,6 +189,14 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     if app.show_timestamps {
         status.push_str(" | ts");
+    }
+    status.push_str(if app.scroll_locked {
+        " | LOCK"
+    } else {
+        " | follow"
+    });
+    if app.show_packets {
+        status.push_str(" | packets");
     }
     if app.view == View::Hex {
         status.push_str(" | HEX (F8)");
@@ -286,6 +293,180 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.set_cursor_position((chunks[2].x + cursor_x, chunks[2].y));
     }
 }
+fn draw_streams(frame: &mut Frame, app: &mut App, area: Rect) {
+    let split = area.width >= 72 || !app.tx_packets.is_empty();
+    let panes = Layout::horizontal([
+        Constraint::Percentage(if split { 65 } else { 100 }),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    let mut rx_block = Block::new();
+    if area.height >= 3 {
+        rx_block = rx_block.borders(Borders::TOP).title(if app.show_packets {
+            " RX — read chunks "
+        } else {
+            " RX — received "
+        });
+    }
+    let rx_area = rx_block.inner(panes[0]);
+    frame.render_widget(rx_block, panes[0]);
+    app.view_height = rx_area.height.max(1);
+    app.hits_ui.push((rx_area, Hit::Output));
+    match app.view {
+        View::Hex if !app.show_packets => draw_hex(frame, app, rx_area),
+        _ => {
+            cached_rows(app, rx_area.width.max(1));
+            let max_top = app.cache.len().saturating_sub(usize::from(app.view_height));
+            let top = max_top.saturating_sub(app.scroll_back.min(max_top));
+            frame.render_widget(
+                Paragraph::new(app.cache.as_slice())
+                    .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0)),
+                rx_area,
+            );
+        }
+    }
+    if !split {
+        return;
+    }
+    let mut block = Block::new().borders(Borders::LEFT);
+    if area.height >= 3 {
+        block = block
+            .borders(Borders::LEFT | Borders::TOP)
+            .title(" TX — sent successfully ");
+    }
+    let tx_area = block.inner(panes[1]);
+    frame.render_widget(block, panes[1]);
+    app.hits_ui.push((tx_area, Hit::TxOutput));
+    let key = (
+        app.tx_bytes,
+        tx_area.width,
+        app.show_timestamps,
+        app.show_packets,
+        app.view,
+    );
+    if app.tx_cache.key != Some(key) {
+        let mut rows = Vec::new();
+        let mut starts = Vec::new();
+        for packet in &app.tx_packets {
+            starts.push(rows.len());
+            packet_rows(
+                &mut rows,
+                packet,
+                "TX",
+                tx_area.width,
+                app.show_timestamps,
+                app.show_packets,
+                app.view,
+            );
+        }
+        let removed = app.tx_packet_dropped.saturating_sub(app.tx_cache.dropped);
+        let removed_rows = if removed == 0 {
+            0
+        } else {
+            app.tx_cache
+                .starts
+                .get(removed)
+                .copied()
+                .unwrap_or(app.tx_cache.rows.len())
+        };
+        preserve_scroll(
+            &mut app.tx_scroll_back,
+            app.tx_cache.rows.len(),
+            rows.len(),
+            usize::from(tx_area.height),
+            removed_rows,
+            app.scroll_locked,
+        );
+        app.tx_cache.rows = rows;
+        app.tx_cache.starts = starts;
+        app.tx_cache.key = Some(key);
+        app.tx_cache.dropped = app.tx_packet_dropped;
+    }
+    let max_top = app
+        .tx_cache
+        .rows
+        .len()
+        .saturating_sub(usize::from(tx_area.height));
+    let top = max_top.saturating_sub(app.tx_scroll_back.min(max_top));
+    let end = top
+        .saturating_add(usize::from(tx_area.height))
+        .min(app.tx_cache.rows.len());
+    frame.render_widget(Paragraph::new(&app.tx_cache.rows[top..end]), tx_area);
+}
+
+fn preserve_scroll(
+    scroll: &mut usize,
+    old: usize,
+    new: usize,
+    height: usize,
+    removed: usize,
+    locked: bool,
+) {
+    if locked || *scroll > 0 {
+        let top = old
+            .saturating_sub(height)
+            .saturating_sub(*scroll)
+            .saturating_sub(removed);
+        *scroll = new.saturating_sub(height).saturating_sub(top);
+    }
+}
+
+fn packet_rows(
+    out: &mut Vec<Line<'static>>,
+    packet: &crate::app::Packet,
+    direction: &str,
+    width: u16,
+    timestamps: bool,
+    packets: bool,
+    view: View,
+) {
+    let mut text = String::new();
+    if timestamps {
+        text.push_str(&format_time(packet.at));
+        text.push(' ');
+    }
+    if packets {
+        text.push_str(&format!("{direction} {}B ", packet.bytes.len()));
+    }
+    if view == View::Hex {
+        use std::fmt::Write;
+        for (index, byte) in packet.bytes.iter().enumerate() {
+            if index > 0 {
+                text.push(' ');
+            }
+            let _ = write!(text, "{byte:02x}");
+        }
+    } else {
+        let mut remaining = packet.bytes.as_slice();
+        while !remaining.is_empty() {
+            let (valid, consumed) = match std::str::from_utf8(remaining) {
+                Ok(text) => (text, remaining.len()),
+                Err(err) => (
+                    std::str::from_utf8(&remaining[..err.valid_up_to()]).unwrap_or_default(),
+                    err.valid_up_to(),
+                ),
+            };
+            for ch in valid.chars() {
+                match ch {
+                    '\r' => text.push_str("\\r"),
+                    '\n' => text.push_str("\\n"),
+                    '\t' => text.push_str("\\t"),
+                    '\\' => text.push_str("\\\\"),
+                    ch if ch.is_control() => text.extend(ch.escape_default()),
+                    ch => text.push(ch),
+                }
+            }
+            remaining = &remaining[consumed..];
+            if let Some((&byte, rest)) = remaining.split_first() {
+                use std::fmt::Write;
+                let _ = write!(text, "\\x{byte:02X}");
+                remaining = rest;
+            }
+        }
+    }
+    let cells: Vec<_> = text.chars().map(|ch| (ch, PLAIN)).collect();
+    push_wrapped(out, &cells, usize::from(width.max(1)));
+}
 
 fn key_label(entry: &crate::config::Macro) -> String {
     match entry.key {
@@ -343,7 +524,8 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         "F2 toggles RAW input; Ctrl+] leaves RAW. F8 toggles text/HEX output.".to_string(),
         "PageUp/Down and mouse wheel scroll. Ctrl+Home/End: oldest/live output.".to_string(),
         "F7 search: type text or re:regex, Enter applies, Esc cancels. Ctrl+N/P: hits.".to_string(),
-        "Ctrl+L clears output | Ctrl+T timestamps | Ctrl+Q always quits.".to_string(),
+        "Ctrl+L clears output | Ctrl+T timestamps | Ctrl+S saves full session | Ctrl+B locks scroll.".to_string(),
+        "Save/Lock/Packets toolbar controls work without typing commands. Ctrl+Q quits after active esptool finishes.".to_string(),
         "/repeat 1000 5 AT sends AT five times; /repeat 1000 0 AT repeats until /stop.".to_string(),
         "/macro ping alt+p AT saves a macro (keys F9-F12 or Alt+character).".to_string(),
     ];
@@ -361,6 +543,12 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         "/help opens this help | /settings opens serial settings | /ports opens ports.",
         "/esp opens ESP-IDF tools | /elf build/app.elf loads matching debug symbols.",
         "/reset resets | /boot or /bootloader enters the ROM bootloader.",
+        "/esp chip-id|flash-id|read-mac runs read-only ROM tools; /esp erase-flash requires confirmation.",
+        "/esp write-flash 0x1000 \"bootloader.bin\" 0x10000 \"app.bin\" previews actual image paths and offsets before confirmation.",
+        "/confirm executes the pending destructive operation; /cancel discards it. Install esptool in Python or set GTUI_ESPTOOL_PYTHON.",
+        "/save [path] exports the full session; existing files are never overwritten. Records contain UTC time, RX/TX/TOOL, exact HEX and escaped text.",
+        "/lock on|off freezes/resumes viewport | /timestamps on|off | /packets on|off.",
+        "RX is left, confirmed TX is right. Packets are serial read/write chunks, not protocol frames. Mouse wheel scrolls each pane.",
         "/eol crlf|lf|cr|none changes the line ending; example: /eol lf.",
         "/hex 01 0d 0a sends exact bytes without adding EOL (also accepts 0x41,42).",
         "/filter i,w,e selects ESP log levels for new rows; /filter all restores all.",
@@ -383,7 +571,92 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     );
 }
 
+fn draw_prompt(frame: &mut Frame, app: &mut App) {
+    let confirm = app.popup == Some(Popup::ConfirmTool);
+    let (title, guidance, button, height) = match app.popup {
+        Some(Popup::Save) => (
+            " Save current session — Esc cancels ",
+            "Destination path. Exports all captured RX/TX/tool records since startup; never overwrites an existing file.",
+            " Save session ",
+            10,
+        ),
+        Some(Popup::Flash) => (
+            " Flash images — Esc cancels ",
+            "Enter <offset> <file> pairs; quote paths with spaces. Example: 0x1000 \"bootloader.bin\" 0x10000 \"app.bin\". Enter previews; nothing is flashed yet.",
+            " Preview flash ",
+            12,
+        ),
+        _ => (
+            " Confirm destructive ESP operation — Esc cancels ",
+            "This operation changes device Flash. Verify target, offsets and image paths below. Up/Down, PgUp/PgDn scroll; Enter executes.",
+            " Execute operation ",
+            22,
+        ),
+    };
+    let inner = popup_frame(frame, app, title, 100, height);
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(guidance).wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    if confirm {
+        let preview = app
+            .pending_tool
+            .as_ref()
+            .map(|tool| tool.summary.clone())
+            .unwrap_or_default();
+        let lines = wrapped_text(preview.lines().map(str::to_string), chunks[1].width);
+        app.popup_selected = app
+            .popup_selected
+            .min(lines.len().saturating_sub(usize::from(chunks[1].height)));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((u16::try_from(app.popup_selected).unwrap_or(u16::MAX), 0)),
+            chunks[1],
+        );
+    } else {
+        let width = usize::from(chunks[1].width.saturating_sub(2));
+        let chars: Vec<char> = app.prompt_input.chars().collect();
+        let shown: String = chars[chars.len().saturating_sub(width)..].iter().collect();
+        frame.render_widget(Paragraph::new(format!("> {shown}")), chunks[1]);
+        if chunks[1].width > 2 && chunks[1].height > 0 {
+            let cursor = shown
+                .chars()
+                .filter_map(UnicodeWidthChar::width)
+                .sum::<usize>()
+                .min(usize::from(chunks[1].width.saturating_sub(3)));
+            frame.set_cursor_position(Position::new(chunks[1].x + 2 + cursor as u16, chunks[1].y));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(button).style(Style::new().fg(Color::Black).bg(if confirm {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        })),
+        chunks[2],
+    );
+    app.hits_ui.push((chunks[2], Hit::DialogApply));
+    frame.render_widget(
+        Paragraph::new(app.status.clone()).wrap(Wrap { trim: false }),
+        chunks[3],
+    );
+}
+
 fn draw_popup(frame: &mut Frame, app: &mut App) {
+    if matches!(
+        app.popup,
+        Some(Popup::Save | Popup::Flash | Popup::ConfirmTool)
+    ) {
+        draw_prompt(frame, app);
+        return;
+    }
     if app.popup == Some(Popup::Elf) {
         let inner = popup_frame(frame, app, " Load application ELF — Esc cancels ", 86, 8);
         let chunks = Layout::vertical([
@@ -481,7 +754,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
             "Hooks need their configured tools on PATH. Select then Enter/click to run."
                 .to_string(),
         ];
-        if items.len() == 3 {
+        if items.len() == 8 {
             info.push(
                 "No hooks configured: add [[hooks]] with name and command to config.".to_string(),
             );
@@ -524,15 +797,26 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
     );
 }
 
-fn draw_hex(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_hex(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let width = usize::from(area.width.max(1));
     let per_row = ((width.saturating_sub(10)) / 4).clamp(4, 16);
     let len = app.raw.len();
     let total = len.div_ceil(per_row);
+    let base = app.raw_total - len as u64;
+    let removed = (base as usize).saturating_sub(app.cache_dropped) / per_row;
+    preserve_scroll(
+        &mut app.scroll_back,
+        app.total_rows,
+        total,
+        usize::from(area.height.max(1)),
+        removed,
+        app.scroll_locked,
+    );
+    app.cache_dropped = base as usize;
+    app.total_rows = total;
     let height = usize::from(area.height.max(1));
     let max_top = total.saturating_sub(height);
     let top = max_top.saturating_sub(app.scroll_back.min(max_top));
-    let base = app.raw_total - len as u64;
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(total.saturating_sub(top).min(height));
     for row in top..total.min(top + height) {
@@ -567,6 +851,26 @@ fn draw_hex(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 fn cached_rows(app: &mut App, width: u16) -> &[Line<'static>] {
     if app.cache_width != width || app.cache_version != app.version {
         let (rows, starts, total) = build_rows(app, width);
+        let dropped = if app.show_packets {
+            app.rx_packet_dropped
+        } else {
+            app.scrollback.dropped()
+        };
+        let removed = dropped.saturating_sub(app.cache_dropped);
+        let removed_rows = if removed == 0 {
+            0
+        } else {
+            app.starts.get(removed).copied().unwrap_or(app.cache.len())
+        };
+        preserve_scroll(
+            &mut app.scroll_back,
+            app.cache.len(),
+            rows.len(),
+            usize::from(app.view_height),
+            removed_rows,
+            app.scroll_locked,
+        );
+        app.cache_dropped = dropped;
         app.cache = rows;
         app.starts = starts;
         app.total_rows = total;
@@ -580,6 +884,22 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
     let limit = usize::from(width.max(1));
     let mut out = Vec::with_capacity(app.scrollback.len() + 1);
     let mut starts = Vec::with_capacity(app.scrollback.len());
+    if app.show_packets {
+        for packet in &app.rx_packets {
+            starts.push(out.len());
+            packet_rows(
+                &mut out,
+                packet,
+                "RX",
+                width,
+                app.show_timestamps,
+                true,
+                app.view,
+            );
+        }
+        let total = out.len();
+        return (out, starts, total);
+    }
     let needle: Vec<char> = app
         .search_query
         .as_deref()
@@ -623,7 +943,18 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
     let pending = app.assembler.pending();
     if !pending.is_empty() {
         cells.clear();
-        cells.extend(pending.iter().map(|c: &Cell| (c.ch, c.style)));
+        if app.show_timestamps {
+            cells.extend(format_time(app.last_rx_at).chars().map(|ch| (ch, PLAIN)));
+            cells.push((' ', PLAIN));
+        }
+        let fallback = crate::esp::log::color(pending);
+        cells.extend(pending.iter().map(|c: &Cell| {
+            let mut style = c.style;
+            if style.fg.is_none() {
+                style.fg = fallback;
+            }
+            (c.ch, style)
+        }));
         push_wrapped(&mut out, &cells, limit);
     }
     let total = out.len();
@@ -725,33 +1056,158 @@ mod tests {
         app
     }
 
-    #[test]
-    fn help_overlay_lists_keys_and_macros() {
-        let macros = vec![crate::config::Macro {
-            name: "ping".to_string(),
-            text: "ping".to_string(),
-            key: KeyCode::Char('p'),
-            mods: KeyModifiers::ALT,
-        }];
-        let mut app = App::new(115200, Vec::new(), None, false, macros, Vec::new());
-        app.start_demo();
-        app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
-        let screen = rendered(&mut app, 80, 24);
-        assert!(screen.contains("help (Esc to close)"), "{screen}");
-        assert!(screen.contains("Alt+p"), "{screen}");
-        assert!(screen.contains("/repeat"), "{screen}");
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!app.quit);
-        assert!(!rendered(&mut app, 80, 24).contains("help (Esc to close)"));
+    fn pane(app: &mut App, tx: bool) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let area = app
+            .hits_ui
+            .iter()
+            .find_map(|(area, hit)| {
+                (if tx {
+                    matches!(hit, Hit::TxOutput)
+                } else {
+                    matches!(hit, Hit::Output)
+                })
+                .then_some(*area)
+            })
+            .unwrap();
+        let mut text = String::new();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                text.push_str(terminal.backend().buffer().cell((x, y)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     #[test]
-    fn raw_mode_row_explains_how_to_leave() {
+    fn locked_unfinished_receive_line_stays_anchored_after_append() {
         let mut app = app();
-        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        let screen = rendered(&mut app, 80, 12);
-        assert!(screen.contains("Ctrl+] to leave"), "{screen}");
-        assert!(screen.contains("RAW"), "{screen}");
+        app.on_event(Event::Data(b"0123456789".repeat(240)));
+        let before = pane(&mut app, false);
+        assert!(app.starts.is_empty());
+        assert!(app.cache.len() > usize::from(app.view_height));
+        app.execute("/lock on");
+        let old_top = app.cache.len() - usize::from(app.view_height) - app.scroll_back;
+        app.on_event(Event::Data(b"NEW-TAIL".repeat(100)));
+        let after = pane(&mut app, false);
+        assert_eq!(after.lines().next(), before.lines().next());
+        assert_eq!(
+            app.cache.len() - usize::from(app.view_height) - app.scroll_back,
+            old_top
+        );
+        app.execute("/lock off");
+        assert!(pane(&mut app, false).contains("NEW-TAIL"));
+    }
+
+    #[test]
+    fn narrow_transmit_pane_shows_newest_row_beyond_u16_offset() {
+        let mut app = app();
+        app.on_event(Event::Written(b"x".to_vec()));
+        let mut terminal = Terminal::new(TestBackend::new(8, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_streams(frame, &mut app, area);
+            })
+            .unwrap();
+        let area = app
+            .hits_ui
+            .iter()
+            .find_map(|(area, hit)| matches!(hit, Hit::TxOutput).then_some(*area))
+            .unwrap();
+        assert!(area.width > 0);
+        let width = usize::from(area.width);
+        let mut bytes = vec![b'x'; (usize::from(u16::MAX) + 10) * width];
+        bytes.extend(vec![b'Z'; width]);
+        app.on_event(Event::Written(bytes));
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_streams(frame, &mut app, area);
+            })
+            .unwrap();
+        assert!(app.tx_cache.rows.len() - usize::from(area.height) > usize::from(u16::MAX));
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((area.x, area.bottom() - 1))
+                .unwrap()
+                .symbol(),
+            "Z"
+        );
+    }
+
+    #[test]
+    fn locked_viewport_survives_append_and_retention_until_unlock() {
+        for packets in [false, true] {
+            let mut app = app();
+            app.scrollback = crate::term::scrollback::Scrollback::new(20, 1024 * 1024);
+            if packets {
+                app.execute("/packets on");
+            }
+            for index in 0..20 {
+                app.on_event(Event::Data(format!("row-{index:02}\n").into_bytes()));
+            }
+            let before = pane(&mut app, false);
+            app.execute("/lock on");
+            for index in 20..23 {
+                app.on_event(Event::Data(format!("row-{index:02}\n").into_bytes()));
+            }
+            assert_eq!(pane(&mut app, false), before);
+            app.execute("/lock off");
+            assert!(pane(&mut app, false).contains("row-22"));
+        }
+    }
+
+    #[test]
+    fn transmit_pane_is_independent_and_packet_metadata_toggles() {
+        let mut app = app();
+        app.on_event(Event::Data(b"from-rx\n".to_vec()));
+        app.on_event(Event::Written(b"from-tx\r\n".to_vec()));
+        let rx = pane(&mut app, false);
+        let tx = pane(&mut app, true);
+        assert!(rx.contains("from-rx") && !rx.contains("from-tx"));
+        assert!(tx.contains("from-tx\\r\\n") && !tx.contains("from-rx"));
+        app.execute("/packets on");
+        assert!(pane(&mut app, false).contains("RX 8B from-rx\\n"));
+        assert!(pane(&mut app, true).contains("TX 9B from-tx\\r\\n"));
+        app.execute("/timestamps on");
+        assert!(
+            pane(&mut app, false)
+                .lines()
+                .find(|line| line.contains("RX 8B"))
+                .unwrap()
+                .as_bytes()[2]
+                == b':'
+        );
+        app.execute("/packets off");
+        assert!(!pane(&mut app, false).contains("RX 8B"));
+    }
+
+    #[test]
+    fn unstyled_esp_levels_are_colored_without_overriding_ansi() {
+        let mut app = app();
+        app.on_event(Event::Data(
+            b"I (1) task: ready\nE (2) task: failed\n\x1b[35mW (3) task: explicit\x1b[0m\n"
+                .to_vec(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app
+            .hits_ui
+            .iter()
+            .find_map(|(area, hit)| matches!(hit, Hit::Output).then_some(*area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((area.x, area.y)).unwrap().fg, Color::Green);
+        assert_eq!(buffer.cell((area.x, area.y + 1)).unwrap().fg, Color::Red);
+        assert_eq!(
+            buffer.cell((area.x, area.y + 2)).unwrap().fg,
+            Color::Magenta
+        );
     }
 
     #[test]

@@ -2,14 +2,16 @@ mod app;
 mod config;
 mod demo;
 mod esp;
+mod esptool;
 mod hooks;
 mod logfile;
 mod serial;
+mod session;
 mod settings;
 mod term;
 mod ui;
 
-use std::io::{self, Stdout};
+use std::io::{self, BufRead, Stdout, Write};
 use std::panic;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -77,8 +79,14 @@ struct Args {
     #[arg(long)]
     no_reset: bool,
     /// No TUI: copy stdin to the port and the port to stdout, then exit on EOF
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["headless", "session_log"])]
     pipe: bool,
+    /// No alternate screen or mouse: accept local commands on stdin; stream escaped RX/TX/tool records
+    #[arg(long, conflicts_with = "pipe")]
+    headless: bool,
+    /// Save complete session capture on normal exit (never overwrite an existing file)
+    #[arg(long, value_name = "PATH", conflicts_with = "pipe")]
+    session_log: Option<PathBuf>,
 }
 
 fn main() -> io::Result<()> {
@@ -170,6 +178,15 @@ fn main() -> io::Result<()> {
         }
     }
 
+    if args.headless && !args.demo && port.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--headless needs a port or --demo",
+        ));
+    }
+    if args.headless {
+        app.record_output = Some(Box::new(io::BufWriter::new(io::stdout())));
+    }
     if args.demo {
         if args.panic {
             app.start_demo_with(true);
@@ -180,11 +197,109 @@ fn main() -> io::Result<()> {
         app.connect(name);
     }
 
-    install_panic_hook();
-    let mut terminal = init_terminal()?;
-    let result = event_loop(&mut terminal, &mut app);
-    restore_terminal()?;
-    result
+    let result = if args.headless {
+        headless_loop(&mut app)
+    } else {
+        install_panic_hook();
+        let mut terminal = init_terminal()?;
+        let result = event_loop(&mut terminal, &mut app);
+        result.and(restore_terminal())
+    };
+    app.finish();
+    let export = match args.session_log {
+        Some(path) => app.save_session(&path).map_err(io::Error::other),
+        None => Ok(()),
+    };
+    result.and(export)
+}
+
+fn headless_loop(app: &mut App) -> io::Result<()> {
+    let (input_tx, input_rx) = std::sync::mpsc::sync_channel(16);
+    std::thread::Builder::new()
+        .name("agent-stdin".to_string())
+        .spawn(move || {
+            for line in io::stdin().lock().lines() {
+                let failed = line.is_err();
+                if input_tx.send(line).is_err() || failed {
+                    return;
+                }
+            }
+        })?;
+    let mut stdout = io::stdout();
+    let mut eof = false;
+    let mut status = String::new();
+    let mut preview = String::new();
+    while !app.quit {
+        if eof && let Ok(event) = app.rx.recv_timeout(Duration::from_millis(16)) {
+            app.on_event(event);
+        }
+        while let Ok(event) = app.rx.try_recv() {
+            app.on_event(event);
+        }
+        match input_rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(Ok(line)) => {
+                session::write_record(&mut stdout, app::now_ms(), "COMMAND", line.as_bytes())?;
+                if line.trim() == "/help" {
+                    session::write_record(&mut stdout, app::now_ms(), "HELP", b"One stdin line sends a payload with configured EOL; // escapes leading slash. Local commands: /ports, /settings, /hex <bytes>, /save [path], /esp chip-id|flash-id|read-mac|erase-flash|write-flash <offset> <file> ..., /confirm, /cancel, /reset, /boot, /seq <steps>, /eol crlf|lf|cr|none, /quit. Destructive ESP commands emit CONFIRM and execute only after /confirm. EOF waits for pending serial commands/tools, then exits.")?;
+                } else if line.trim() == "/ports" {
+                    app.replace_ports(serial::list_ports());
+                    app.status = if app.ports.is_empty() {
+                        "ports: none found".to_string()
+                    } else {
+                        format!(
+                            "ports: {}",
+                            app.ports
+                                .iter()
+                                .map(|port| port.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    status.clear();
+                } else if line.trim() == "/settings" {
+                    app.status = format!("settings: {:?}, eol={}", app.settings, app.eol.label());
+                    status.clear();
+                } else {
+                    app.execute(&line);
+                }
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eof = true;
+                app.repeat = None;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        app.tick();
+        if app.status != status {
+            session::write_record(&mut stdout, app::now_ms(), "STATE", app.status.as_bytes())?;
+            status.clone_from(&app.status);
+        }
+        let current = app
+            .pending_tool
+            .as_ref()
+            .map(|tool| tool.summary.as_str())
+            .unwrap_or_default();
+        if current != preview {
+            if !current.is_empty() {
+                session::write_record(&mut stdout, app::now_ms(), "CONFIRM", current.as_bytes())?;
+            }
+            preview.clear();
+            preview.push_str(current);
+        }
+        stdout.flush()?;
+        if let Some(err) = app.record_output_error.take() {
+            return Err(err);
+        }
+        if eof
+            && app.active_hook().is_none()
+            && app.pending_writes == 0
+            && app.pending_controls == 0
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {

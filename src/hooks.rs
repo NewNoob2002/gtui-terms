@@ -10,14 +10,19 @@ pub struct Outcome {
 /// Output is meant for the scrollback, so it is capped.
 const MAX_OUTPUT: usize = 64 * 1024;
 
-#[cfg(windows)]
-const SHELL: (&str, &str) = ("cmd", "/C");
-#[cfg(not(windows))]
-const SHELL: (&str, &str) = ("sh", "-c");
-
 pub fn run(command: &str) -> Outcome {
-    let (shell, flag) = SHELL;
-    match Command::new(shell).arg(flag).arg(command).output() {
+    let shell = if cfg!(windows) { "cmd" } else { "sh" };
+    let mut process = Command::new(shell);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        process
+            .args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command}\""));
+    }
+    #[cfg(not(windows))]
+    process.args(["-c", command]);
+    match process.output() {
         Ok(output) => {
             let mut text = String::new();
             text.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -29,7 +34,11 @@ pub fn run(command: &str) -> Outcome {
                 text.push_str(&stderr);
             }
             if text.len() > MAX_OUTPUT {
-                text.truncate(MAX_OUTPUT);
+                let mut end = MAX_OUTPUT;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
             }
             Outcome {
                 ok: output.status.success(),
@@ -52,6 +61,16 @@ mod tests {
         let outcome = run("echo hook-ok");
         assert!(outcome.ok);
         assert!(outcome.text.contains("hook-ok"), "{:?}", outcome.text);
+    }
+
+    #[test]
+    fn unicode_output_limit_preserves_completion_and_valid_text() {
+        let outcome = run(
+            "python -c \"import sys; sys.stdout.buffer.write(b'a' * 65535 + bytes([0xc3, 0xa9])); sys.exit(3)\"",
+        );
+        assert!(!outcome.ok);
+        assert_eq!(outcome.text.len(), MAX_OUTPUT - 1);
+        assert!(outcome.text.bytes().all(|byte| byte == b'a'));
     }
 
     #[test]

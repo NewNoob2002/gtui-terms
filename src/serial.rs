@@ -32,10 +32,13 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Event {
     Data(Vec<u8>),
+    Written(Vec<u8>),
+    WriteFailed(String),
+    ToolOutput(String),
     Connected(String),
     Disconnected(String),
     Reconnecting,
-    Notice(String),
+    ControlDone(String),
     HookDone {
         name: String,
         ok: bool,
@@ -228,7 +231,14 @@ pub fn spawn(
                         while let Ok(command) = writes.try_recv() {
                             match command {
                                 Command::Write(data) => {
-                                    let _ = port.write_all(&data).and_then(|()| port.flush());
+                                    match port.write_all(&data).and_then(|()| port.flush()) {
+                                        Ok(()) => {
+                                            let _ = tx.send(Event::Written(data));
+                                        }
+                                        Err(err) => {
+                                            let _ = tx.send(Event::WriteFailed(err.to_string()));
+                                        }
+                                    }
                                 }
                                 Command::Reset {
                                     into_bootloader,
@@ -242,7 +252,7 @@ pub fn spawn(
                                         Ok(()) => "chip reset".to_string(),
                                         Err(err) => format!("reset failed: {err}"),
                                     };
-                                    if tx.send(Event::Notice(text)).is_err() {
+                                    if tx.send(Event::ControlDone(text)).is_err() {
                                         return;
                                     }
                                 }
@@ -251,7 +261,7 @@ pub fn spawn(
                                         Ok(()) => "custom sequence done".to_string(),
                                         Err(err) => format!("sequence failed: {err}"),
                                     };
-                                    if tx.send(Event::Notice(text)).is_err() {
+                                    if tx.send(Event::ControlDone(text)).is_err() {
                                         return;
                                     }
                                 }
@@ -266,7 +276,9 @@ pub fn spawn(
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                             Err(e) => {
-                                let _ = tx.send(Event::Disconnected(e.to_string()));
+                                let reason = e.to_string();
+                                fail_pending(&writes, &tx, &reason);
+                                let _ = tx.send(Event::Disconnected(reason));
                                 alive = false;
                             }
                         }
@@ -278,12 +290,15 @@ pub fn spawn(
                     reset::park(port.as_mut());
                 }
                 Err(e) => {
-                    if tx.send(Event::Disconnected(e.to_string())).is_err() {
+                    let reason = e.to_string();
+                    fail_pending(&writes, &tx, &reason);
+                    if tx.send(Event::Disconnected(reason)).is_err() {
                         return;
                     }
                 }
             }
             if stop.load(Ordering::Relaxed) {
+                fail_pending(&writes, &tx, "serial worker stopped");
                 return;
             }
             if tx.send(Event::Reconnecting).is_err() {
@@ -292,4 +307,48 @@ pub fn spawn(
             thread::sleep(RETRY_DELAY);
         }
     })
+}
+
+fn fail_pending(writes: &Receiver<Command>, tx: &Sender<Event>, reason: &str) {
+    while let Ok(command) = writes.try_recv() {
+        let event = match command {
+            Command::Write(_) => Event::WriteFailed(reason.to_string()),
+            Command::Reset { .. } => Event::ControlDone(format!("reset failed: {reason}")),
+            Command::Sequence(_) => Event::ControlDone(format!("sequence failed: {reason}")),
+        };
+        let _ = tx.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_commands_each_report_completion() {
+        let (commands, writes) = std::sync::mpsc::channel();
+        let (tx, events) = std::sync::mpsc::channel();
+        commands.send(Command::Write(vec![1])).unwrap();
+        commands
+            .send(Command::Reset {
+                into_bootloader: false,
+                kind: reset::Kind::Classic,
+            })
+            .unwrap();
+        commands.send(Command::Sequence(Vec::new())).unwrap();
+
+        fail_pending(&writes, &tx, "port unavailable");
+
+        assert!(
+            matches!(events.try_recv().unwrap(), Event::WriteFailed(text) if text == "port unavailable")
+        );
+        assert!(
+            matches!(events.try_recv().unwrap(), Event::ControlDone(text) if text == "reset failed: port unavailable")
+        );
+        assert!(
+            matches!(events.try_recv().unwrap(), Event::ControlDone(text) if text == "sequence failed: port unavailable")
+        );
+        assert!(events.try_recv().is_err());
+        assert!(writes.try_recv().is_err());
+    }
 }
