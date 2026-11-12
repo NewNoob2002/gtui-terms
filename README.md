@@ -23,7 +23,7 @@ Windows: MSVC or the GNU toolchain both work (`rustup override set stable-x86_64
 ## Use
 
 ```sh
-gtui-terms                      # pick a port
+gtui-terms                      # live port picker -> serial settings -> Apply
 gtui-terms COM4 -b 921600       # Windows
 gtui-terms /dev/ttyUSB0         # Linux
 gtui-terms --demo --panic       # no hardware: simulated boot, progress bar and a panic dump
@@ -32,13 +32,27 @@ gtui-terms COM4 --data-bits 7 --parity even --stop-bits 2 --flow hardware
 gtui-terms COM4 --no-reset --pipe   # script mode: stdin -> port, port -> stdout
 ```
 
-Keys: `F1` help, `F2` line/raw toggle, `F5` reset, `F6` bootloader, `F7` search (prefix the query with `re:` for a regex), `F8` hex view, `PageUp/PageDown` scroll, `Ctrl+Home/Ctrl+End` jump to oldest / follow the tail, `Ctrl+N/Ctrl+P` next/previous search hit, `Ctrl+T` timestamps, `Ctrl+L` clear, `Ctrl+Q` quit. In raw mode `Ctrl+]` returns to line mode.
+With no configured port, the picker stays open even when no devices exist and refreshes every 500 ms. Selection follows the port name through reordering. Click a port or press Enter to review baud rate (including custom values), data bits, stop bits, parity, flow control, send EOL, and reset-on-connect before applying. `R` refreshes immediately; an explicit CLI/config port still connects directly.
 
-Line commands: `/reset`, `/boot`, `/seq D0 R1 W0.5` (custom DTR/RTS steps, `W` in seconds), `/eol crlf|lf|cr|none`, `/hex 01 0d`, `/filter i,w,e` (send only the listed levels) or `/filter all`, `/repeat <ms> <count|0> <text>`, `/stop`, `/macro <name> <key> <text>`, `/hook <name>`, `/hooks`, `//text` sends a literal leading slash.
+The toolbar provides **Ports**, **Settings**, **Actions**, **ESP**, **Help**, and **Quit**. Click it or use Tab, Left/Right, and Enter. `Ctrl+O` opens ports; `F3` opens settings; `F4` opens actions. Applying settings reconnects the current hardware port; Cancel discards the draft. Changes apply to the current session; use the config file for startup defaults. Click output to read without transmitting, then click input to send. Mouse wheel scrolls output and menus. Settings, help, search, and action dialogs consume input even in RAW mode. `F1` or `/help` opens the scrollable command and shortcut reference.
+
+Keys: `F1` help, `F2` line/raw toggle, `F3` settings, `F4` actions, `F5` reset, `F6` bootloader, `F7` search (prefix the query with `re:` for a regex), `F8` hex view, `Ctrl+O` ports, `PageUp/PageDown` scroll, `Ctrl+Home/Ctrl+End` jump to oldest / follow the tail, `Ctrl+N/Ctrl+P` next/previous search hit, `Ctrl+T` timestamps, `Ctrl+L` clear, `Ctrl+Q` quit. In raw mode `Ctrl+]` returns to line mode.
+
+Line commands: `/help`, `/ports`, `/settings`, `/esp`, `/elf <path>`, `/reset`, `/boot` (or `/bootloader`), `/seq D0 R1 W0.5` (custom DTR/RTS steps, `W` in seconds), `/eol crlf|lf|cr|none`, `/hex 01 0d`, `/filter i,w,e` (show only the listed levels) or `/filter all`, `/repeat <ms> <count|0> <text>`, `/stop`, `/macro <name> <key> <text>`, `/hook <name>`, `/hooks`, `//text` sends a literal leading slash.
 
 The status bar shows the frame format (`921600 baud 8N1`), RX/TX byte totals with a 500 ms RX rate, dropped lines, and the active filter. Command history is kept in `%APPDATA%\gtui-terms\history.txt` (or `$XDG_CONFIG_HOME/gtui-terms/history.txt`). If no `--elf` is given, `build/*.elf` is picked up automatically.
 
 ANSI rendering supports 16/256/RGB foreground and background colours, bold, underline and their resets. Invalid UTF-8 bytes appear as exact `\xNN` escapes; the status bar reports their cumulative count as `invalid UTF-8 N`.
+
+## ESP-IDF workflow
+
+Open **ESP** on the toolbar or run `/esp`. The panel shows the device, active ELF, automatic panic/coredump status, capture directory, reset wiring, and configured hooks. Select reset, bootloader, ELF loading, hook listing, or a configured hook with the keyboard or mouse.
+
+1. Load the matching application ELF with debug symbols through **Load ELF** or `/elf build/app.elf`. Panic detection runs on incoming UART data; matching symbols enable address/source decoding, and an ELF SHA mismatch is reported.
+2. Enable UART base64 coredumps in the firmware to capture real dumps. The console saves both `.txt` and decoded `.bin` beside the raw log, or in the current directory without logging. Feed the binary into the appropriate `esp-coredump` tooling with the matching ELF.
+3. Configure hooks for `idf.py`, `esptool`, or GDB, and install those tools on PATH. Selecting a hook runs its actual shell command after releasing the port; the console reconnects afterward. Configured regex triggers still run automatically. The ESP panel displays the active hook and last detection result.
+
+The clickable toolbar and separate configuration/action dialogs follow the interaction pattern of [termapy](https://github.com/hucker/termapy).
 
 ## Config
 
