@@ -1,55 +1,173 @@
 use chrono::{Local, TimeZone};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, Eol, Mode, View};
+use crate::app::{App, Eol, Focus, Hit, Mode, Popup, View};
 use crate::term::scrollback::{Cell, HIGHLIGHT, PLAIN, match_mask};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.hits_ui.clear();
+    let area = frame.area();
+    let header = draw_toolbar(frame, app);
+    let remaining = area.height.saturating_sub(header);
+    let show_hint = area.height >= 6;
+    let body = Rect::new(
+        area.x,
+        area.y + header,
+        area.width,
+        remaining.saturating_sub(u16::from(show_hint)),
+    );
     match app.mode {
-        Mode::Picker => draw_picker(frame, app),
-        Mode::Terminal => draw_terminal(frame, app),
+        Mode::Picker => draw_picker(frame, app, body),
+        Mode::Terminal => draw_terminal(frame, app, body),
+    }
+    if show_hint && remaining > 0 {
+        let hint = format!(
+            " Tab: toolbar/output/input | focus {:?} | click input to send | F1 /help | Ctrl+Q quit",
+            app.focus
+        );
+        frame.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::Cyan)),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        );
+    }
+    if app.help {
+        draw_help(frame, app);
+    } else if app.popup.is_some() {
+        draw_popup(frame, app);
+    }
+    if let Some(dialog) = &mut app.settings_dialog {
+        dialog.draw(frame);
     }
 }
 
-fn draw_picker(frame: &mut Frame, app: &mut App) {
+fn draw_toolbar(frame: &mut Frame, app: &mut App) -> u16 {
     let area = frame.area();
-    let block = Block::bordered().title(" GTUI-TERMS | select port (up/down, Enter, q) ");
-    let inner = block.inner(area);
-    let items: Vec<ListItem> = app
-        .ports
-        .iter()
-        .enumerate()
-        .map(|(i, port)| {
-            let style = if i == app.selected {
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            ListItem::new(format!("{:<12} {}", port.name, port.label)).style(style)
-        })
-        .collect();
-    frame.render_widget(block, area);
-    frame.render_widget(List::new(items), inner);
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+    let labels = [
+        "Ports ^O",
+        "Settings F3",
+        "Actions F4",
+        "ESP",
+        "Help F1",
+        "Quit ^Q",
+    ];
+    let mut start = 0;
+    if app.focus == Focus::Toolbar {
+        while start < app.toolbar_selected
+            && labels[start..=app.toolbar_selected]
+                .iter()
+                .map(|label| label.len() + 3)
+                .sum::<usize>()
+                > usize::from(area.width)
+        {
+            start += 1;
+        }
+    }
+    let mut x = area.x;
+    for (index, label) in labels.iter().enumerate().skip(start) {
+        if x >= area.right() {
+            break;
+        }
+        let text = format!(" {label} ");
+        let width = (text.len() as u16).min(area.right() - x);
+        let rect = Rect::new(x, area.y, width, 1);
+        let style = if app.focus == Focus::Toolbar && app.toolbar_selected == index {
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        };
+        frame.render_widget(Paragraph::new(text).style(style), rect);
+        app.hits_ui.push((rect, Hit::Toolbar(index)));
+        x = x.saturating_add(width).saturating_add(1);
+    }
+    1
 }
 
-fn draw_terminal(frame: &mut Frame, app: &mut App) {
+fn draw_picker(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered().title(" Ports — live refresh 500ms | Enter/click: settings ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let chunks = Layout::vertical([
-        Constraint::Min(1),
         Constraint::Length(1),
+        Constraint::Min(0),
         Constraint::Length(1),
     ])
-    .split(frame.area());
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new("[ Refresh (R) ]  Up/Down: select  Esc: return")
+            .style(Style::default().fg(Color::Cyan)),
+        chunks[0],
+    );
+    app.hits_ui.push((
+        Rect::new(
+            chunks[0].x,
+            chunks[0].y,
+            chunks[0].width.min(15),
+            chunks[0].height,
+        ),
+        Hit::Refresh,
+    ));
+    if app.ports.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "No serial ports yet. Plug in a USB device; this list updates automatically.",
+            )
+            .wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    } else {
+        let visible = usize::from(chunks[1].height);
+        let start = app.selected.saturating_sub(visible.saturating_sub(1));
+        let items: Vec<ListItem> = app
+            .ports
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, port)| {
+                let row = chunks[1].y + (index - start) as u16;
+                app.hits_ui.push((
+                    Rect::new(chunks[1].x, row, chunks[1].width, 1),
+                    Hit::Port(index),
+                ));
+                let style = if index == app.selected {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(format!("{:<12} {}", port.name, port.label)).style(style)
+            })
+            .collect();
+        frame.render_widget(List::new(items), chunks[1]);
+    }
+    frame.render_widget(
+        Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Yellow)),
+        chunks[2],
+    );
+}
+
+fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(u16::from(area.height >= 4)),
+        Constraint::Length(1),
+    ])
+    .split(area);
 
     app.view_height = chunks[0].height.max(1);
+    app.hits_ui.push((chunks[0], Hit::Output));
+    app.hits_ui.push((chunks[2], Hit::Input));
     match app.view {
         View::Hex => draw_hex(frame, app, chunks[0]),
         View::Text => {
@@ -64,7 +182,8 @@ fn draw_terminal(frame: &mut Frame, app: &mut App) {
     }
 
     let mut status = format!(
-        " {} | {} | {} lines",
+        " {} | {} | {} | {} lines",
+        app.status,
         app.label,
         app.serial_label(),
         app.scrollback.len()
@@ -116,9 +235,6 @@ fn draw_terminal(frame: &mut Frame, app: &mut App) {
     if let Some(path) = &app.log_path {
         status.push_str(&format!(" | log {path}"));
     }
-    if !app.status.is_empty() {
-        status.push_str(&format!(" | {}", app.status));
-    }
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
         chunks[1],
@@ -136,11 +252,24 @@ fn draw_terminal(frame: &mut Frame, app: &mut App) {
         }
     };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![prompt, Span::raw(text)])),
+        Paragraph::new(Line::from(vec![prompt, Span::raw(text)])).style(
+            if app.focus == Focus::Input {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            },
+        ),
         chunks[2],
     );
 
-    if !app.raw_mode {
+    if !app.raw_mode
+        && app.focus == Focus::Input
+        && !app.help
+        && app.popup.is_none()
+        && app.settings_dialog.is_none()
+        && chunks[2].width > 0
+        && chunks[2].height > 0
+    {
         let prompt_width = if app.search_input.is_some() { 1 } else { 2 };
         let used: usize = match &app.search_input {
             Some(buf) => buf
@@ -156,10 +285,6 @@ fn draw_terminal(frame: &mut Frame, app: &mut App) {
         let cursor_x = cursor_x.min(chunks[2].width.saturating_sub(1));
         frame.set_cursor_position((chunks[2].x + cursor_x, chunks[2].y));
     }
-
-    if app.help {
-        draw_help(frame, app);
-    }
 }
 
 fn key_label(entry: &crate::config::Macro) -> String {
@@ -170,44 +295,232 @@ fn key_label(entry: &crate::config::Macro) -> String {
     }
 }
 
-fn draw_help(frame: &mut Frame, app: &App) {
-    let mut lines = vec![
-        Line::from("F1 help  F2 line/raw  F7 search  F8 hex  Ctrl+N/P next/prev hit"),
-        Line::from("PageUp/PageDown scroll  Ctrl+L clear  Ctrl+T timestamps  Ctrl+Q quit"),
-        Line::from("/repeat <ms> <count|0> <text>  /stop  // literal slash"),
-        Line::from("/macro <name> <f9-f12|alt+char> <text>  save a macro"),
-        Line::from(""),
-    ];
-    if app.macros.is_empty() {
-        lines.push(Line::from("no macros: add [[macros]] to .gtui-terms.toml"));
-    } else {
-        lines.push(Line::from("macros:"));
-        for entry in &app.macros {
-            lines.push(Line::from(format!(
-                "  {}  {} -> {:?}",
-                key_label(entry),
-                entry.name,
-                entry.text
-            )));
-        }
-    }
+fn popup_frame(frame: &mut Frame, app: &mut App, title: &str, width: u16, height: u16) -> Rect {
     let area = frame.area();
-    let width = 68.min(area.width.saturating_sub(4)).max(20);
-    let height = u16::try_from(lines.len() + 2)
-        .unwrap_or(u16::MAX)
-        .min(area.height.saturating_sub(2));
-    let rect = ratatui::layout::Rect::new(
-        area.x + (area.width.saturating_sub(width)) / 2,
-        area.y + (area.height.saturating_sub(height)) / 2,
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
         width,
         height,
     );
-    frame.render_widget(ratatui::widgets::Clear, rect);
+    app.popup_rect = rect;
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(title)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if width >= 5 && height > 0 {
+        let close = Rect::new(rect.right() - 5, rect.y, 4, 1);
+        frame.render_widget(
+            Paragraph::new("[X]").style(Style::default().fg(Color::Yellow)),
+            close,
+        );
+        app.hits_ui.push((close, Hit::Close));
+    }
+    inner
+}
+
+fn wrapped_text(text: impl IntoIterator<Item = String>, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for text in text {
+        let cells: Vec<_> = text.chars().map(|ch| (ch, PLAIN)).collect();
+        push_wrapped(&mut lines, &cells, usize::from(width.max(1)));
+    }
+    lines
+}
+
+fn draw_help(frame: &mut Frame, app: &mut App) {
+    let height = frame.area().height.saturating_sub(2).max(1);
+    let inner = popup_frame(frame, app, " help (Esc to close) ", 90, height);
+    let mut text = vec![
+        "GTUI-TERMS — click the toolbar or use Tab, arrows and Enter.".to_string(),
+        "Ports / Ctrl+O: choose a live port, review Settings, then Apply to connect.".to_string(),
+        "F3 Settings | F4 Actions | F5 reset | F6 bootloader | F1 help".to_string(),
+        "Click output to read safely; click input to type/send. Tab cycles focus.".to_string(),
+        "F2 toggles RAW input; Ctrl+] leaves RAW. F8 toggles text/HEX output.".to_string(),
+        "PageUp/Down and mouse wheel scroll. Ctrl+Home/End: oldest/live output.".to_string(),
+        "F7 search: type text or re:regex, Enter applies, Esc cancels. Ctrl+N/P: hits.".to_string(),
+        "Ctrl+L clears output | Ctrl+T timestamps | Ctrl+Q always quits.".to_string(),
+        "/repeat 1000 5 AT sends AT five times; /repeat 1000 0 AT repeats until /stop.".to_string(),
+        "/macro ping alt+p AT saves a macro (keys F9-F12 or Alt+character).".to_string(),
+    ];
+    for entry in &app.macros {
+        text.push(format!(
+            "Macro {}: {} -> {:?}",
+            entry.name,
+            key_label(entry),
+            entry.text
+        ));
+    }
+    text.extend([
+        "Line mode: Enter sends with selected EOL; Up/Down recalls saved history.",
+        "//help sends literal /help; a single leading slash runs a local command.",
+        "/help opens this help | /settings opens serial settings | /ports opens ports.",
+        "/esp opens ESP-IDF tools | /elf build/app.elf loads matching debug symbols.",
+        "/reset resets | /boot or /bootloader enters the ROM bootloader.",
+        "/eol crlf|lf|cr|none changes the line ending; example: /eol lf.",
+        "/hex 01 0d 0a sends exact bytes without adding EOL (also accepts 0x41,42).",
+        "/filter i,w,e selects ESP log levels for new rows; /filter all restores all.",
+        "/seq D0 R1 W0.1 R0 runs DTR/RTS/wait steps (W is seconds).",
+        "/hooks lists configured hooks | /hook build runs the hook named build.",
+        "ESP: panic detection runs automatically. Matching application ELF with debug symbols enables address/source decoding in output; a mismatched SHA is flagged.",
+        "ESP coredumps: enable UART base64 coredumps in firmware; captures are saved beside the raw log, or in the working directory, and their location appears in output.",
+        "Hooks run the actual configured shell command; install its tools (for example idf.py/esptool) and make them available on PATH. Select a hook explicitly to run it. Existing configured regex triggers also apply.",
+        "Settings: baud, bits, parity, stop bits, flow, line ending, and reset-on-connect. Apply reconnects hardware; Cancel keeps current settings.",
+        "Actions: reconnect/disconnect, clear output, timestamps, HEX, search and RAW.",
+        "Help scroll: Up/Down, PageUp/Down, Home/End or mouse wheel. Esc/F1, [X] or an outside click closes. Typing here never reaches the device.",
+    ].into_iter().map(str::to_string));
+    let lines = wrapped_text(text, inner.width);
+    app.help_height = usize::from(inner.height.max(1));
+    app.help_max_scroll = lines.len().saturating_sub(app.help_height);
+    app.help_scroll = app.help_scroll.min(app.help_max_scroll);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title(" help (Esc to close) "))
-            .style(Style::default().bg(Color::Black).fg(Color::White)),
-        rect,
+        Paragraph::new(lines).scroll((u16::try_from(app.help_scroll).unwrap_or(u16::MAX), 0)),
+        inner,
+    );
+}
+
+fn draw_popup(frame: &mut Frame, app: &mut App) {
+    if app.popup == Some(Popup::Elf) {
+        let inner = popup_frame(frame, app, " Load application ELF — Esc cancels ", 86, 8);
+        let chunks = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+        frame.render_widget(
+            Paragraph::new("Enter the matching application .elf path. Ctrl+U clears; Enter loads.")
+                .wrap(Wrap { trim: false }),
+            chunks[0],
+        );
+        let text = format!("> {}", app.elf_input);
+        let used: usize = text
+            .chars()
+            .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+            .sum();
+        let offset = used.saturating_sub(usize::from(chunks[1].width.saturating_sub(1)));
+        frame.render_widget(
+            Paragraph::new(text)
+                .scroll((0, u16::try_from(offset).unwrap_or(u16::MAX)))
+                .style(Style::default().bg(Color::DarkGray)),
+            chunks[1],
+        );
+        frame.render_widget(
+            Paragraph::new("[ Load ELF ]").style(Style::default().fg(Color::Cyan)),
+            chunks[2],
+        );
+        app.hits_ui.push((chunks[2], Hit::ElfApply));
+        frame.render_widget(
+            Paragraph::new(app.status.as_str()).wrap(Wrap { trim: false }),
+            chunks[3],
+        );
+        if chunks[1].width > 0 && chunks[1].height > 0 {
+            frame.set_cursor_position((
+                chunks[1].x + (used.saturating_sub(offset) as u16).min(chunks[1].width - 1),
+                chunks[1].y,
+            ));
+        }
+        return;
+    }
+    let items = app.menu_items();
+    let esp = app.popup == Some(Popup::Esp);
+    let height = u16::try_from(items.len() + if esp { 14 } else { 4 }).unwrap_or(u16::MAX);
+    let inner = popup_frame(
+        frame,
+        app,
+        if esp {
+            " ESP-IDF tools — Esc closes "
+        } else {
+            " Actions — arrows/Enter or click "
+        },
+        if esp { 100 } else { 58 },
+        height,
+    );
+    let info_height = if esp {
+        inner.height.saturating_sub(4).min(10)
+    } else {
+        0
+    };
+    let chunks = Layout::vertical([
+        Constraint::Length(info_height),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    if esp {
+        let elf = app
+            .elf_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| {
+                "none — load matching application ELF for source locations".to_string()
+            });
+        let mut info = vec![
+            format!(
+                "Device: {} — {}",
+                if app.label.is_empty() {
+                    "none"
+                } else {
+                    &app.label
+                },
+                app.status
+            ),
+            format!("ELF: {elf}"),
+            "Panic decoding: automatic in output; needs matching ELF/debug symbols.".to_string(),
+            format!(
+                "Coredump: requires firmware UART/base64; auto-save -> {}",
+                app.coredump_directory().display()
+            ),
+            format!("Last detection: {}", app.esp_status),
+            "Reset/bootloader requires board-specific DTR/RTS wiring to EN/boot pins.".to_string(),
+            "Hooks need their configured tools on PATH. Select then Enter/click to run."
+                .to_string(),
+        ];
+        if items.len() == 3 {
+            info.push(
+                "No hooks configured: add [[hooks]] with name and command to config.".to_string(),
+            );
+        }
+        if let Some(name) = app.active_hook() {
+            info.push(format!("Running hook: {name}"));
+        }
+        frame.render_widget(
+            Paragraph::new(wrapped_text(info, chunks[0].width)),
+            chunks[0],
+        );
+    }
+    let visible = usize::from(chunks[1].height);
+    let start = app.popup_selected.saturating_sub(visible.saturating_sub(1));
+    let rows: Vec<_> = items
+        .into_iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, text)| {
+            let rect = Rect::new(
+                chunks[1].x,
+                chunks[1].y + (index - start) as u16,
+                chunks[1].width,
+                1,
+            );
+            app.hits_ui.push((rect, Hit::Menu(index)));
+            ListItem::new(text).style(if index == app.popup_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default()
+            })
+        })
+        .collect();
+    frame.render_widget(List::new(rows), chunks[1]);
+    frame.render_widget(
+        Paragraph::new("Up/Down: choose  Enter: run  Esc/[X]: close")
+            .style(Style::default().fg(Color::Cyan)),
+        chunks[2],
     );
 }
 
@@ -389,7 +702,9 @@ mod tests {
     use crate::serial::Event;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     fn rendered(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -405,7 +720,9 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(115200, Vec::new(), None, false, Vec::new(), Vec::new())
+        let mut app = App::new(115200, Vec::new(), None, false, Vec::new(), Vec::new());
+        app.mode = Mode::Terminal;
+        app
     }
 
     #[test]
@@ -555,7 +872,13 @@ mod tests {
         ));
         let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let cells = terminal.backend().buffer().content();
+        let output = app
+            .hits_ui
+            .iter()
+            .find_map(|(rect, hit)| matches!(hit, Hit::Output).then_some(*rect))
+            .unwrap();
+        let cells = &terminal.backend().buffer().content()
+            [usize::from(output.y) * 80 + usize::from(output.x)..];
         assert_eq!(cells[0].symbol(), "A");
         assert_eq!(cells[0].fg, Color::Red);
         assert_eq!(cells[0].bg, Color::Blue);
@@ -596,7 +919,13 @@ mod tests {
         app.run_search();
         let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let cells = terminal.backend().buffer().content();
+        let output = app
+            .hits_ui
+            .iter()
+            .find_map(|(rect, hit)| matches!(hit, Hit::Output).then_some(*rect))
+            .unwrap();
+        let cells = &terminal.backend().buffer().content()
+            [usize::from(output.y) * 80 + usize::from(output.x)..];
         assert_eq!(cells[0].fg, Color::Black);
         assert_eq!(cells[0].bg, Color::Yellow);
         assert!(
@@ -635,5 +964,62 @@ mod tests {
         }
         let text = rendered(&mut app, 40, 8);
         assert!(text.contains("line 19"));
+    }
+
+    #[test]
+    fn toolbar_mouse_help_consumes_input_and_help_scrolls() {
+        let mut app = app();
+        app.demo = true;
+        app.raw_mode = true;
+        rendered(&mut app, 80, 12);
+        let help = app
+            .hits_ui
+            .iter()
+            .find_map(|(rect, hit)| matches!(hit, Hit::Toolbar(4)).then_some(*rect))
+            .unwrap();
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: help.x,
+            row: help.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.help);
+        rendered(&mut app, 80, 12);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tx_bytes, 0);
+        assert!(app.help_max_scroll > 0);
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, app.help_max_scroll);
+        let screen = rendered(&mut app, 80, 12);
+        assert!(
+            screen.contains("Typing here never reaches the device"),
+            "{screen}"
+        );
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.help);
+        assert_eq!(app.tx_bytes, 0);
+    }
+
+    #[test]
+    fn picker_terminal_and_all_dialogs_clip_to_small_terminals() {
+        for width in [1, 8, 20, 80] {
+            for height in [1, 2, 4, 12] {
+                let mut app = app();
+                rendered(&mut app, width, height);
+                for opener in [KeyCode::F(4), KeyCode::F(1), KeyCode::F(3)] {
+                    app.on_key(KeyEvent::new(opener, KeyModifiers::NONE));
+                    rendered(&mut app, width, height);
+                    app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                }
+                app.mode = Mode::Picker;
+                rendered(&mut app, width, height);
+            }
+        }
     }
 }

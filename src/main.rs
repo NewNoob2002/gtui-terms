@@ -5,6 +5,7 @@ mod esp;
 mod hooks;
 mod logfile;
 mod serial;
+mod settings;
 mod term;
 mod ui;
 
@@ -16,7 +17,9 @@ use std::time::Duration;
 use clap::Parser;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{Event as TerminalEvent, KeyEventKind, poll, read};
+use ratatui::crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyEventKind, poll, read,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -175,11 +178,6 @@ fn main() -> io::Result<()> {
         }
     } else if let Some(name) = &port {
         app.connect(name);
-    } else if !app.ports.is_empty() {
-        // picker mode
-    } else {
-        eprintln!("no serial ports found; use --demo or pass a port name");
-        std::process::exit(1);
     }
 
     install_panic_hook();
@@ -192,13 +190,19 @@ fn main() -> io::Result<()> {
 fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
 fn restore_terminal() -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, cursor::Show)
+    let raw_result = disable_raw_mode();
+    let screen_result = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        cursor::Show
+    );
+    raw_result.and(screen_result)
 }
 
 fn install_panic_hook() {
@@ -214,6 +218,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         if poll(Duration::from_millis(16))? {
             match read()? {
                 TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                TerminalEvent::Mouse(event) => app.on_mouse(event),
                 _ => app.dirty = true,
             }
         }

@@ -5,7 +5,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 
@@ -79,6 +82,32 @@ pub enum Mode {
     Terminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Toolbar,
+    Output,
+    Input,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Popup {
+    Actions,
+    Esp,
+    Elf,
+}
+
+#[derive(Clone, Copy)]
+pub enum Hit {
+    Toolbar(usize),
+    Port(usize),
+    Refresh,
+    Output,
+    Input,
+    Menu(usize),
+    Close,
+    ElfApply,
+}
+
 pub struct App {
     pub mode: Mode,
     pub view: View,
@@ -116,6 +145,20 @@ pub struct App {
     pub macros: Vec<crate::config::Macro>,
     pub config_path: std::path::PathBuf,
     pub help: bool,
+    pub focus: Focus,
+    pub toolbar_selected: usize,
+    pub hits_ui: Vec<(Rect, Hit)>,
+    pub popup: Option<Popup>,
+    pub popup_selected: usize,
+    pub popup_rect: Rect,
+    pub elf_input: String,
+    pub help_scroll: usize,
+    pub help_max_scroll: usize,
+    pub help_height: usize,
+    pub settings_dialog: Option<crate::settings::SettingsDialog>,
+    pending_port: Option<(String, ResetKind)>,
+    ports_refreshed: std::time::Instant,
+    pub esp_status: String,
     pub raw_mode: bool,
     pub eol: Eol,
     pub rx_bytes: u64,
@@ -136,7 +179,7 @@ pub struct App {
     last_flush: std::time::Instant,
     scanner: panic::Scanner,
     symbols: Option<elf::Symbols>,
-    elf_path: Option<std::path::PathBuf>,
+    pub elf_path: Option<std::path::PathBuf>,
     hooks: Vec<crate::config::Hook>,
     hook_running: Option<String>,
     reopen_after_hook: Option<(String, ResetKind)>,
@@ -154,11 +197,7 @@ impl App {
     ) -> Self {
         let (tx, rx) = channel();
         Self {
-            mode: if ports.is_empty() {
-                Mode::Terminal
-            } else {
-                Mode::Picker
-            },
+            mode: Mode::Picker,
             view: View::Text,
             raw: VecDeque::new(),
             raw_total: 0,
@@ -194,6 +233,20 @@ impl App {
             macros,
             config_path: std::path::PathBuf::from(crate::config::LOCAL_FILE),
             help: false,
+            focus: Focus::Input,
+            toolbar_selected: 0,
+            hits_ui: Vec::new(),
+            popup: None,
+            popup_selected: 0,
+            popup_rect: Rect::default(),
+            elf_input: String::new(),
+            help_scroll: 0,
+            help_max_scroll: 0,
+            help_height: 1,
+            settings_dialog: None,
+            pending_port: None,
+            ports_refreshed: std::time::Instant::now(),
+            esp_status: "Listening for panic backtraces and UART base64 coredumps".to_string(),
             raw_mode: false,
             eol: Eol::CrLf,
             rx_bytes: 0,
@@ -223,8 +276,8 @@ impl App {
     }
 
     /// Loads debug symbols; failures are reported in the status line, not fatal.
-    pub fn set_elf(&mut self, path: std::path::PathBuf) {
-        match elf::Symbols::load(&path) {
+    pub fn set_elf(&mut self, path: std::path::PathBuf) -> bool {
+        let loaded = match elf::Symbols::load(&path) {
             Ok(symbols) => {
                 self.elf_sha = elf_sha256(&path);
                 self.status = match &self.elf_sha {
@@ -233,10 +286,15 @@ impl App {
                 };
                 self.symbols = Some(symbols);
                 self.elf_path = Some(path);
+                true
             }
-            Err(err) => self.status = err,
-        }
+            Err(err) => {
+                self.status = err;
+                false
+            }
+        };
         self.dirty = true;
+        loaded
     }
 
     pub fn connect(&mut self, name: &str) {
@@ -249,12 +307,23 @@ impl App {
     }
 
     pub fn connect_with(&mut self, name: &str, kind: ResetKind) {
+        if self.hook_running.is_some() {
+            self.status = "Wait for the running hook before connecting".to_string();
+            self.dirty = true;
+            return;
+        }
         self.shutdown_worker();
         self.stop = Arc::new(AtomicBool::new(false));
         let (writes, write_rx) = channel();
         self.writes = Some(writes);
         self.reset_kind = kind;
         self.mode = Mode::Terminal;
+        self.focus = Focus::Input;
+        self.search_input = None;
+        self.repeat = None;
+        self.assembler.reset();
+        self.scanner = panic::Scanner::new();
+        self.version += 1;
         self.label = name.to_string();
         self.demo = false;
         self.reconnecting = false;
@@ -283,6 +352,8 @@ impl App {
         self.stop = Arc::new(AtomicBool::new(false));
         self.writes = None;
         self.mode = Mode::Terminal;
+        self.focus = Focus::Input;
+        self.repeat = None;
         self.label = "demo".to_string();
         self.demo = true;
         self.status = "simulated device".to_string();
@@ -295,13 +366,7 @@ impl App {
     }
 
     pub fn connect_selected(&mut self) {
-        let chosen = self
-            .ports
-            .get(self.selected)
-            .map(|port| (port.name.clone(), ResetKind::from_pid(port.pid)));
-        if let Some((name, kind)) = chosen {
-            self.connect_with(&name, kind);
-        }
+        self.open_settings(true);
     }
 
     pub fn run_hook(&mut self, name: &str) {
@@ -420,25 +485,43 @@ impl App {
                     None => format!("[panic] 0x{address:08x} → ?? (no symbol)"),
                 },
                 None => {
-                    format!("[panic] 0x{address:08x} (no ELF loaded: pass --elf PATH)")
+                    format!("[panic] 0x{address:08x} (no ELF loaded: ESP > Load ELF, or /elf PATH)")
                 }
             };
             self.push_text(&text, PLAIN, at);
         }
-        self.status = format!("panic decoded ({} addresses)", report.addresses.len());
+        self.status = format!(
+            "panic {} ({} addresses); details in output",
+            if self.symbols.is_some() {
+                "decoded"
+            } else {
+                "captured; load matching ELF to decode future panics"
+            },
+            report.addresses.len()
+        );
+        self.esp_status = self.status.clone();
         self.version += 1;
     }
 
-    fn save_coredump(&mut self, text: &str) {
-        let directory = self
-            .log
+    pub fn coredump_directory(&self) -> &std::path::Path {
+        self.log
             .as_ref()
             .and_then(|log| log.path().parent())
-            .unwrap_or_else(|| std::path::Path::new("."));
+            .unwrap_or_else(|| std::path::Path::new("."))
+    }
+
+    pub fn active_hook(&self) -> Option<&str> {
+        self.hook_running.as_deref()
+    }
+
+    fn save_coredump(&mut self, text: &str) {
+        let directory = self.coredump_directory();
         self.status = match crate::esp::coredump::save(text, directory) {
             Ok(path) => format!("coredump saved to {}", path.display()),
             Err(err) => format!("coredump capture failed: {err}"),
         };
+        self.esp_status = self.status.clone();
+        self.push_text(&format!("[coredump] {}", self.status), PLAIN, now_ms());
         self.version += 1;
     }
 
@@ -506,78 +589,513 @@ impl App {
         }
     }
 
+    pub fn replace_ports(&mut self, ports: Vec<PortInfo>) {
+        let selected_name = self.ports.get(self.selected).map(|port| port.name.as_str());
+        let selected =
+            selected_name.and_then(|name| ports.iter().position(|port| port.name == name));
+        self.selected = selected.unwrap_or(self.selected.min(ports.len().saturating_sub(1)));
+        self.ports = ports;
+        self.dirty = true;
+    }
+
+    fn refresh_ports(&mut self) {
+        self.replace_ports(serial::list_ports());
+        self.ports_refreshed = std::time::Instant::now();
+    }
+
+    fn open_ports(&mut self) {
+        self.popup = None;
+        self.search_input = None;
+        self.mode = Mode::Picker;
+        self.focus = Focus::Output;
+        self.refresh_ports();
+        self.repeat = None;
+    }
+
+    fn open_settings(&mut self, selected: bool) {
+        self.popup = None;
+        self.pending_port = if selected {
+            self.ports
+                .get(self.selected)
+                .map(|port| (port.name.clone(), ResetKind::from_pid(port.pid)))
+        } else {
+            None
+        };
+        if selected && self.pending_port.is_none() {
+            self.status = "Waiting for a serial port; plug in a device or Refresh (R)".to_string();
+            return;
+        }
+        self.settings_dialog = Some(crate::settings::SettingsDialog::new(
+            self.settings,
+            self.eol,
+            self.auto_reset,
+        ));
+    }
+
+    fn settings_action(&mut self, action: crate::settings::DialogAction) {
+        use crate::settings::DialogAction;
+        match action {
+            DialogAction::Continue => {}
+            DialogAction::Cancel => {
+                self.settings_dialog = None;
+                self.pending_port = None;
+            }
+            DialogAction::Apply => {
+                let Some(dialog) = &self.settings_dialog else {
+                    return;
+                };
+                let (settings, eol, auto_reset) = match dialog.values() {
+                    Ok(values) => values,
+                    Err(error) => {
+                        self.status = error;
+                        return;
+                    }
+                };
+                self.settings = settings;
+                self.eol = eol;
+                self.auto_reset = auto_reset;
+                self.settings_dialog = None;
+                if let Some((name, kind)) = self.pending_port.take() {
+                    self.connect_with(&name, kind);
+                } else if !self.demo && self.writes.is_some() {
+                    self.connect_with(&self.label.clone(), self.reset_kind);
+                } else {
+                    self.status = "Settings applied".to_string();
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn toolbar_action(&mut self, index: usize) {
+        match index {
+            0 => self.open_ports(),
+            1 => self.open_settings(false),
+            2 => self.open_popup(Popup::Actions),
+            3 => self.open_popup(Popup::Esp),
+            4 => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
+            5 => self.quit = true,
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn open_popup(&mut self, popup: Popup) {
+        self.popup = Some(popup);
+        self.popup_selected = 0;
+        if popup == Popup::Elf {
+            self.elf_input = self
+                .elf_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+        }
+        self.dirty = true;
+    }
+
+    pub fn menu_items(&self) -> Vec<String> {
+        match self.popup {
+            Some(Popup::Actions) => vec![
+                "Settings (F3)".to_string(),
+                "Ports (Ctrl+O)".to_string(),
+                "Reconnect current device".to_string(),
+                "Disconnect".to_string(),
+                "Clear output (Ctrl+L)".to_string(),
+                format!(
+                    "Timestamps: {} (Ctrl+T)",
+                    if self.show_timestamps { "on" } else { "off" }
+                ),
+                format!(
+                    "View: {} (F8)",
+                    if self.view == View::Hex {
+                        "HEX"
+                    } else {
+                        "text"
+                    }
+                ),
+                "Search output (F7)".to_string(),
+                format!("Input: {} (F2)", if self.raw_mode { "RAW" } else { "line" }),
+                "ESP-IDF tools".to_string(),
+                "Help (F1)".to_string(),
+            ],
+            Some(Popup::Esp) => {
+                let mut items = vec![
+                    "Reset device (F5)".to_string(),
+                    "Enter bootloader (F6)".to_string(),
+                    "Load ELF symbols...".to_string(),
+                ];
+                items.extend(
+                    self.hooks
+                        .iter()
+                        .map(|hook| format!("Run hook: {} — {}", hook.name, hook.command)),
+                );
+                items
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn toggle_hex(&mut self) {
+        self.view = if self.view == View::Text {
+            View::Hex
+        } else {
+            View::Text
+        };
+        self.scroll_back = 0;
+        self.version += 1;
+    }
+
+    fn toggle_timestamps(&mut self) {
+        self.show_timestamps = !self.show_timestamps;
+        self.version += 1;
+    }
+
+    fn menu_action(&mut self, index: usize) {
+        let popup = self.popup.take();
+        match popup {
+            Some(Popup::Actions) => match index {
+                0 => self.open_settings(false),
+                1 => self.open_ports(),
+                2 => {
+                    if self.demo {
+                        self.start_demo();
+                    } else if !self.label.is_empty() {
+                        self.connect_with(&self.label.clone(), self.reset_kind);
+                    } else {
+                        self.open_ports();
+                    }
+                }
+                3 => {
+                    self.shutdown_worker();
+                    self.repeat = None;
+                    self.reopen_after_hook = None;
+                    self.reconnecting = false;
+                    self.demo = false;
+                    self.status = "Disconnected; use Actions > Reconnect or Ports".to_string();
+                }
+                4 => self.clear(),
+                5 => self.toggle_timestamps(),
+                6 => self.toggle_hex(),
+                7 => self.open_search(),
+                8 => {
+                    self.raw_mode = !self.raw_mode;
+                    self.focus = Focus::Input;
+                }
+                9 => self.open_popup(Popup::Esp),
+                10 => {
+                    self.help = true;
+                    self.help_scroll = 0;
+                }
+                _ => {}
+            },
+            Some(Popup::Esp) => match index {
+                0 => self.queue_reset(false),
+                1 => self.queue_reset(true),
+                2 => self.open_popup(Popup::Elf),
+                _ => {
+                    if let Some(name) = self
+                        .hooks
+                        .get(index.saturating_sub(3))
+                        .map(|hook| hook.name.clone())
+                    {
+                        self.run_hook(&name);
+                    }
+                }
+            },
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn apply_elf_input(&mut self) {
+        let path = self.elf_input.trim().trim_matches('"');
+        if path.is_empty() {
+            self.status = "Enter a path to the matching application ELF".to_string();
+            return;
+        }
+        if self.set_elf(std::path::PathBuf::from(path)) {
+            self.open_popup(Popup::Esp);
+        }
+    }
+
+    fn popup_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.popup = None;
+            return;
+        }
+        if self.popup == Some(Popup::Elf) {
+            match key.code {
+                KeyCode::Enter => self.apply_elf_input(),
+                KeyCode::Backspace => {
+                    self.elf_input.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.elf_input.clear()
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && self.elf_input.len() < MAX_INPUT =>
+                {
+                    self.elf_input.push(ch)
+                }
+                _ => {}
+            }
+            return;
+        }
+        let count = self.menu_items().len();
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                self.popup_selected = self.popup_selected.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.popup_selected = (self.popup_selected + 1).min(count.saturating_sub(1))
+            }
+            KeyCode::Home => self.popup_selected = 0,
+            KeyCode::End => self.popup_selected = count.saturating_sub(1),
+            KeyCode::Enter => self.menu_action(self.popup_selected),
+            _ => {}
+        }
+    }
+
+    pub fn on_mouse(&mut self, event: MouseEvent) {
+        self.dirty = true;
+        if let Some(dialog) = &mut self.settings_dialog {
+            let action = dialog.on_mouse(event);
+            self.settings_action(action);
+            return;
+        }
+        let position = ratatui::layout::Position::new(event.column, event.row);
+        let hit = self
+            .hits_ui
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(position))
+            .map(|(_, hit)| *hit);
+        if self.help {
+            match event.kind {
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => {
+                    self.help_scroll = (self.help_scroll + 3).min(self.help_max_scroll)
+                }
+                MouseEventKind::Down(MouseButton::Left)
+                    if matches!(hit, Some(Hit::Close)) || !self.popup_rect.contains(position) =>
+                {
+                    self.help = false
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.popup.is_some() {
+            match event.kind {
+                MouseEventKind::ScrollUp => {
+                    self.popup_selected = self.popup_selected.saturating_sub(1)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.popup_selected =
+                        (self.popup_selected + 1).min(self.menu_items().len().saturating_sub(1))
+                }
+                MouseEventKind::Down(MouseButton::Left) => match hit {
+                    Some(Hit::Menu(index)) => self.menu_action(index),
+                    Some(Hit::ElfApply) => self.apply_elf_input(),
+                    Some(Hit::Close) => self.popup = None,
+                    _ if !self.popup_rect.contains(position) => self.popup = None,
+                    _ => {}
+                },
+                _ => {}
+            }
+            return;
+        }
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => match hit {
+                Some(Hit::Toolbar(index)) => {
+                    self.toolbar_selected = index;
+                    self.toolbar_action(index);
+                }
+                Some(Hit::Refresh) => self.refresh_ports(),
+                Some(Hit::Port(index)) => {
+                    self.selected = index;
+                    self.open_settings(true);
+                }
+                Some(Hit::Output) => {
+                    self.focus = Focus::Output;
+                    self.search_input = None;
+                }
+                Some(Hit::Input) => self.focus = Focus::Input,
+                _ => {}
+            },
+            MouseEventKind::ScrollUp if self.mode == Mode::Picker => {
+                self.selected = self.selected.saturating_sub(1)
+            }
+            MouseEventKind::ScrollDown if self.mode == Mode::Picker => {
+                self.selected = (self.selected + 1).min(self.ports.len().saturating_sub(1))
+            }
+            MouseEventKind::ScrollUp if matches!(hit, Some(Hit::Output)) => {
+                self.scroll_back = self.scroll_back.saturating_add(3)
+            }
+            MouseEventKind::ScrollDown if matches!(hit, Some(Hit::Output)) => {
+                self.scroll_back = self.scroll_back.saturating_sub(3)
+            }
+            _ => {}
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('q') {
+            self.quit = true;
+            return;
+        }
+        self.dirty = true;
+        if let Some(dialog) = &mut self.settings_dialog {
+            let action = dialog.on_key(key);
+            self.settings_action(action);
+            return;
+        }
+        if self.help {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(1) => self.help = false,
+                KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                KeyCode::Down => {
+                    self.help_scroll = (self.help_scroll + 1).min(self.help_max_scroll)
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(self.help_height)
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll =
+                        (self.help_scroll + self.help_height).min(self.help_max_scroll)
+                }
+                KeyCode::Home => self.help_scroll = 0,
+                KeyCode::End => self.help_scroll = self.help_max_scroll,
+                _ => {}
+            }
+            return;
+        }
+        if self.popup.is_some() {
+            self.popup_key(key);
+            return;
+        }
         match key.code {
-            KeyCode::Char('q') if ctrl => {
-                self.quit = true;
+            KeyCode::F(1) => {
+                self.help = true;
+                self.help_scroll = 0;
+                return;
+            }
+            KeyCode::F(3) => {
+                self.open_settings(false);
+                return;
+            }
+            KeyCode::F(4) => {
+                self.open_popup(Popup::Actions);
+                return;
+            }
+            KeyCode::Char('o') if ctrl => {
+                self.open_ports();
+                return;
+            }
+            KeyCode::F(5) if self.mode == Mode::Terminal => {
+                self.queue_reset(false);
+                return;
+            }
+            KeyCode::F(6) if self.mode == Mode::Terminal => {
+                self.queue_reset(true);
+                return;
+            }
+            KeyCode::F(7) if self.mode == Mode::Terminal && self.search_input.is_none() => {
+                self.open_search();
+                return;
+            }
+            KeyCode::F(8) if self.mode == Mode::Terminal && self.search_input.is_none() => {
+                self.toggle_hex();
+                return;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let backwards =
+                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+                self.focus = match (self.focus, backwards, self.mode) {
+                    (Focus::Toolbar, false, _) => Focus::Output,
+                    (Focus::Output, false, Mode::Terminal) => Focus::Input,
+                    (Focus::Output, false, Mode::Picker) | (Focus::Input, false, _) => {
+                        Focus::Toolbar
+                    }
+                    (Focus::Toolbar, true, Mode::Terminal) => Focus::Input,
+                    (Focus::Toolbar, true, Mode::Picker) | (Focus::Input, true, _) => Focus::Output,
+                    (Focus::Output, true, _) => Focus::Toolbar,
+                };
                 return;
             }
             _ => {}
         }
-        if self.raw_mode {
-            if key.code == KeyCode::F(2) || (ctrl && key.code == KeyCode::Char(']')) {
-                self.raw_mode = false;
-                self.status = "line mode".to_string();
-                self.dirty = true;
-                return;
+        if self.search_input.is_some() {
+            self.search_key(key);
+            return;
+        }
+        if self.focus == Focus::Toolbar {
+            match key.code {
+                KeyCode::Left | KeyCode::Up => {
+                    self.toolbar_selected = (self.toolbar_selected + 5) % 6
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    self.toolbar_selected = (self.toolbar_selected + 1) % 6
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.toolbar_action(self.toolbar_selected),
+                KeyCode::Esc => self.focus = Focus::Output,
+                _ => {}
             }
-            self.raw_send(key);
+            return;
+        }
+        if self.mode == Mode::Picker {
+            self.picker_key(key);
             return;
         }
         match key.code {
-            KeyCode::F(2) => {
-                self.raw_mode = true;
-                self.status = "raw mode (Ctrl+] to leave)".to_string();
-                self.dirty = true;
-                return;
-            }
             KeyCode::Char('l') if ctrl => {
                 self.clear();
                 return;
             }
             KeyCode::Char('t') if ctrl => {
-                self.show_timestamps = !self.show_timestamps;
-                self.version += 1;
-                self.dirty = true;
+                self.toggle_timestamps();
                 return;
             }
-            KeyCode::F(1) => {
-                self.help = !self.help;
-                self.dirty = true;
-                return;
-            }
-            KeyCode::F(5) => {
-                self.queue_reset(false);
-                return;
-            }
-            KeyCode::F(6) => {
-                self.queue_reset(true);
-                return;
-            }
-            KeyCode::F(7) => {
-                self.open_search();
-                return;
-            }
-            KeyCode::F(8) => {
-                self.view = match self.view {
-                    View::Text => View::Hex,
-                    View::Hex => View::Text,
-                };
-                self.scroll_back = 0;
-                self.version += 1;
-                self.dirty = true;
-                return;
-            }
-            KeyCode::Char('n') if ctrl => {
+            KeyCode::Char('n') if ctrl && !self.raw_mode => {
                 self.step_hit(true);
                 return;
             }
-            KeyCode::Char('p') if ctrl => {
+            KeyCode::Char('p') if ctrl && !self.raw_mode => {
                 self.step_hit(false);
                 return;
             }
+            KeyCode::F(2) => {
+                self.raw_mode = !self.raw_mode;
+                return;
+            }
+            KeyCode::Char(']') if ctrl && self.raw_mode => {
+                self.raw_mode = false;
+                return;
+            }
             _ => {}
+        }
+        if self.focus == Focus::Output {
+            match key.code {
+                KeyCode::Up => self.scroll_back = self.scroll_back.saturating_add(1),
+                KeyCode::Down => self.scroll_back = self.scroll_back.saturating_sub(1),
+                KeyCode::PageUp => self.scroll_page(true),
+                KeyCode::PageDown => self.scroll_page(false),
+                KeyCode::Home => self.scroll_home(),
+                KeyCode::End => self.scroll_end(),
+                _ => {}
+            }
+            return;
+        }
+        if self.raw_mode {
+            self.raw_send(key);
+            return;
         }
         if let Some(entry) = self
             .macros
@@ -591,17 +1109,9 @@ impl App {
             } else {
                 self.status = "no port open".to_string();
             }
-            self.dirty = true;
             return;
         }
-        if self.search_input.is_some() {
-            self.search_key(key);
-            return;
-        }
-        match self.mode {
-            Mode::Picker => self.picker_key(key),
-            Mode::Terminal => self.terminal_key(key),
-        }
+        self.terminal_key(key);
     }
 
     fn open_search(&mut self) {
@@ -609,6 +1119,7 @@ impl App {
             return;
         }
         let seed = self.search_query.clone().unwrap_or_default();
+        self.focus = Focus::Input;
         self.search_input = Some(seed.chars().collect());
         self.dirty = true;
     }
@@ -824,7 +1335,11 @@ impl App {
 
     fn picker_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.quit = true,
+            KeyCode::Esc if !self.label.is_empty() => {
+                self.mode = Mode::Terminal;
+                self.focus = Focus::Output;
+            }
+            KeyCode::Char('r') | KeyCode::F(5) => self.refresh_ports(),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
                 self.dirty = true;
@@ -846,11 +1361,7 @@ impl App {
             KeyCode::PageDown => self.scroll_page(false),
             KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_home(),
             KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_end(),
-            KeyCode::Esc if self.help => {
-                self.help = false;
-                self.dirty = true;
-            }
-            KeyCode::Esc => self.quit = true,
+            KeyCode::Esc => self.focus = Focus::Output,
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
@@ -1009,6 +1520,30 @@ impl App {
 
     fn command(&mut self, text: &str) {
         let rest = text.trim_start_matches('/').trim();
+        match rest {
+            "help" => {
+                self.help = true;
+                self.help_scroll = 0;
+                return;
+            }
+            "esp" => {
+                self.open_popup(Popup::Esp);
+                return;
+            }
+            "settings" => {
+                self.open_settings(false);
+                return;
+            }
+            "ports" => {
+                self.open_ports();
+                return;
+            }
+            _ => {}
+        }
+        if let Some(path) = rest.strip_prefix("elf ") {
+            self.set_elf(std::path::PathBuf::from(path.trim().trim_matches('"')));
+            return;
+        }
         if rest == "reset" {
             self.queue_reset(false);
             return;
@@ -1118,7 +1653,7 @@ impl App {
             return;
         }
         let Some(args) = rest.strip_prefix("repeat") else {
-            self.status = format!("unknown command {text} (try /repeat <ms> <count> <text>)");
+            self.status = format!("unknown command {text} (try /help)");
             return;
         };
         let mut parts = args.trim_start().splitn(3, ' ');
@@ -1146,6 +1681,11 @@ impl App {
     /// Fires due repeat sends; call every loop iteration.
     pub fn tick(&mut self) {
         self.refresh_rate();
+        if self.mode == Mode::Picker
+            && self.ports_refreshed.elapsed() >= std::time::Duration::from_millis(500)
+        {
+            self.refresh_ports();
+        }
         let Some(mut rep) = self.repeat.take() else {
             return;
         };
@@ -1214,6 +1754,15 @@ impl App {
             let _ = worker.join();
         }
         self.writes = None;
+        let mut hook_done = None;
+        while let Ok(event) = self.rx.try_recv() {
+            if matches!(event, Event::HookDone { .. }) {
+                hook_done = Some(event);
+            }
+        }
+        if let Some(event) = hook_done {
+            let _ = self.tx.send(event);
+        }
     }
 
     #[cfg(test)]
@@ -1319,7 +1868,9 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(115200, Vec::new(), None, false, Vec::new(), Vec::new())
+        let mut app = App::new(115200, Vec::new(), None, false, Vec::new(), Vec::new());
+        app.mode = Mode::Terminal;
+        app
     }
 
     #[test]
@@ -1656,5 +2207,147 @@ mod tests {
         assert_eq!(app.scrollback.len(), 1);
         app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         assert_eq!(app.scrollback.len(), 0);
+    }
+
+    fn ports(names: &[&str]) -> Vec<PortInfo> {
+        names
+            .iter()
+            .map(|name| PortInfo {
+                name: (*name).to_string(),
+                label: "USB serial".to_string(),
+                pid: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hotplug_preserves_port_identity_and_clamps_removal() {
+        let mut app = App::new(
+            115200,
+            ports(&["COM3", "COM7"]),
+            None,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        app.selected = 1;
+        app.replace_ports(ports(&["COM7", "COM1", "COM3"]));
+        assert_eq!(app.ports[app.selected].name, "COM7");
+        assert_eq!(app.selected, 0);
+        app.selected = 2;
+        app.replace_ports(ports(&["COM7"]));
+        assert_eq!(app.selected, 0);
+        app.replace_ports(Vec::new());
+        assert_eq!(app.selected, 0);
+        assert!(app.mode == Mode::Picker && !app.quit);
+        app.replace_ports(ports(&["COM9"]));
+        assert_eq!(app.ports[app.selected].name, "COM9");
+    }
+
+    #[test]
+    fn empty_picker_waits_and_cancelled_settings_never_opens_port() {
+        let mut app = App::new(115200, Vec::new(), None, false, Vec::new(), Vec::new());
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.mode == Mode::Picker && app.settings_dialog.is_none());
+        app.replace_ports(ports(&["COM7"]));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.settings_dialog.is_some());
+        assert!(app.worker.is_none());
+        app.replace_ports(ports(&["COM9", "COM7"]));
+        assert_eq!(app.pending_port.as_ref().unwrap().0, "COM7");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.settings_dialog.is_none() && app.pending_port.is_none());
+        assert!(app.mode == Mode::Picker && app.worker.is_none());
+    }
+
+    #[test]
+    fn help_settings_actions_search_and_output_consume_raw_and_macro_keys() {
+        let mut app = app();
+        let (writes, commands) = channel();
+        app.writes = Some(writes);
+        app.raw_mode = true;
+        app.macros.push(crate::config::Macro {
+            name: "ping".to_string(),
+            text: "AT".to_string(),
+            key: KeyCode::Char('p'),
+            mods: KeyModifiers::ALT,
+        });
+        for opener in [KeyCode::F(1), KeyCode::F(3), KeyCode::F(4)] {
+            app.on_key(key(opener));
+            typed(&mut app, "secret");
+            app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+            app.on_key(key(KeyCode::Esc));
+        }
+        app.on_key(key(KeyCode::F(7)));
+        typed(&mut app, "needle");
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.search_query.as_deref(), Some("needle"));
+        app.focus = Focus::Output;
+        typed(&mut app, "secret");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        app.focus = Focus::Toolbar;
+        app.toolbar_selected = 4;
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.help);
+        assert_eq!(app.tx_bytes, 0);
+        assert!(commands.try_recv().is_err());
+        assert!(app.input.is_empty());
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn mouse_focus_prevents_sending_until_input_is_clicked() {
+        let mut app = app();
+        app.demo = true;
+        app.raw_mode = true;
+        app.hits_ui = vec![
+            (Rect::new(0, 1, 20, 4), Hit::Output),
+            (Rect::new(0, 6, 20, 1), Hit::Input),
+        ];
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        typed(&mut app, "secret");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.tx_bytes, 0);
+        assert_eq!(app.focus, Focus::Output);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        });
+        typed(&mut app, "x");
+        assert_eq!(app.tx_bytes, 1);
+    }
+
+    #[test]
+    fn demo_settings_apply_never_acquires_a_port_and_shutdown_drains_old_events() {
+        let mut app = app();
+        app.demo = true;
+        app.label = "demo".to_string();
+        app.open_settings(false);
+        app.settings_action(crate::settings::DialogAction::Apply);
+        assert!(app.demo && app.worker.is_none() && app.writes.is_none());
+        app.tx
+            .send(Event::Connected("old port".to_string()))
+            .unwrap();
+        app.tx.send(Event::Data(b"old bytes".to_vec())).unwrap();
+        app.tx
+            .send(Event::HookDone {
+                name: "build".to_string(),
+                ok: true,
+                output: String::new(),
+            })
+            .unwrap();
+        app.shutdown_worker();
+        assert!(matches!(app.rx.try_recv(), Ok(Event::HookDone { .. })));
+        assert!(app.rx.try_recv().is_err());
     }
 }
