@@ -370,3 +370,12 @@ graph LR
 - ConPTY 实测 release `--demo --panic --config`：`/macro smoke f9 hello world` 写回配置且保留已有宏、hook 和设备字段；F9 输出 `hello world`、状态栏 `tx 13 B | macro smoke`，Ctrl+Q 正常退出。
 - 待外部条件验收：真实 ESP32 复位/bootloader/拔插/921600 长跑、Xtensa/RISC-V 真实 ELF、真实 coredump 工具消费、Linux 与 GitHub CI 运行。当前机器仅执行 Windows GNU 工具链验证。
 
+### CH340 + ESP32 实机验证（2026-11-12）
+
+- 设备：Windows GNU、COM3、USB-SERIAL CH340 `1a86:7523`，ESP32-D0WD-V3 rev v3.1，115200 8N1。现有固件为 X-Rover，ESP-IDF v5.5.1-dirty；未刷写或擦除 Flash。
+- 已验证：启动日志与原始日志保存、`/reset` 重启、`/boot` 输出 `DOWNLOAD_BOOT`/`waiting for download`、再次复位恢复原应用并持续输出 `Sd Status: 0`。
+- 发现并修复 Classic bootloader 的 DTR/RTS 次序错误：先 EN 低，再释放 EN 并保持 GPIO0 低，最后释放 GPIO0；回归测试检查实际复位/采样阶段的引脚逻辑。修复后 81 个测试与 Clippy 通过，release 实机进入下载模式。
+- 使用隔离环境中的 esptool 5.6.0，以 `--before no-reset --after hard-reset --no-stub chip-id` 只读识别 ESP32-D0WD-V3，随后 RTS 复位；没有上传 stub 或改写固件。
+- 固件报告的 input-only GPIO pull-up 错误和 SD 初始化失败属于板上应用日志；终端如实保留。
+- 尚未验收：TUI 原始 TX/RX 往返、物理拔插后的新选择器交互、921600 长跑、其他板型、真实 ELF/panic/coredump 以及 Linux。
+

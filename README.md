@@ -71,4 +71,4 @@ A hook closes the port first, runs the command through `cmd /C` (Windows) or `sh
 
 ## Known limits
 
-No hardware in the development environment, so real-board reset timing, sustained serial throughput and Xtensa/RISC-V symbolization are unverified. ANSI support covers SGR, `ESC[K/D/C/G` and OSC skipping rather than full VT100 emulation. Coredump decoding is byte-verified with synthetic UART captures; real-board dumps have not been checked with `esp-coredump`. No built-in flashing protocol: use hooks.
+Windows GNU with a CH340 (`1a86:7523`) and ESP32-D0WD-V3 has been checked at 115200 8N1: boot/log capture, hardware reset, download-mode entry, and recovery to the existing ESP-IDF application. A read-only esptool ROM diagnostic also identified the chip. Sustained throughput, other boards, Linux, and real Xtensa/RISC-V symbolization remain unverified. ANSI support covers SGR, `ESC[K/D/C/G` and OSC skipping rather than full VT100 emulation. Coredump decoding is byte-verified with synthetic UART captures; real-board dumps have not been checked with `esp-coredump`. No built-in flashing protocol: use hooks.

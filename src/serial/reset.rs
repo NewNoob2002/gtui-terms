@@ -77,13 +77,13 @@ pub fn apply(
 ) -> io::Result<()> {
     match (kind, into_bootloader) {
         (Kind::Classic, true) => {
-            pins.set_dtr(true)?;
-            pins.set_rts(false)?;
-            wait(ENTER_BOOT_SET);
             pins.set_dtr(false)?;
             pins.set_rts(true)?;
-            wait(ENTER_BOOT_UNSET);
+            wait(ENTER_BOOT_SET);
             pins.set_dtr(true)?;
+            pins.set_rts(false)?;
+            wait(ENTER_BOOT_UNSET);
+            pins.set_dtr(false)?;
         }
         (Kind::Classic, false) => {
             pins.set_rts(true)?;
@@ -248,19 +248,40 @@ mod tests {
     }
 
     #[test]
-    fn classic_bootloader_matches_esp_idf_monitor() {
-        let mock = run_mock(Kind::Classic, true);
+    fn classic_download_holds_reset_then_samples_gpio0_low() {
+        use std::cell::Cell;
+
+        struct StrapPins<'a>(&'a Cell<(bool, bool)>);
+
+        impl LinePins for StrapPins<'_> {
+            fn set_dtr(&mut self, high: bool) -> io::Result<()> {
+                self.0.set((high, self.0.get().1));
+                Ok(())
+            }
+
+            fn set_rts(&mut self, high: bool) -> io::Result<()> {
+                self.0.set((self.0.get().0, high));
+                Ok(())
+            }
+        }
+
+        let state = Cell::new((false, false));
+        let mut phases = Vec::new();
+        apply(&mut StrapPins(&state), Kind::Classic, true, &mut |delay| {
+            let (dtr, rts) = state.get();
+            // The board's transistor pair drives EN/IO0 low only when the lines differ.
+            phases.push((rts && !dtr, dtr && !rts, delay));
+        })
+        .unwrap();
+
         assert_eq!(
-            mock.events,
+            phases,
             vec![
-                ('D', true),
-                ('R', false),
-                ('D', false),
-                ('R', true),
-                ('D', true)
+                (true, false, ENTER_BOOT_SET),
+                (false, true, ENTER_BOOT_UNSET)
             ]
         );
-        assert_eq!(mock.waits, vec![ENTER_BOOT_SET, ENTER_BOOT_UNSET]);
+        assert_eq!(state.get(), (false, false));
     }
 
     #[test]
