@@ -1,0 +1,22 @@
+[package]
+name = "gtui-terms"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "TUI serial terminal for ESP32 debugging on Windows and Linux"
+
+[dependencies]
+addr2line = "0.27"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clap = { version = "4.6.7", features = ["derive"] }
+ratatui = "0.30.2"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serialport = "4.10.1"
+sha2 = "0.11.1"
+toml = "1.2.1"
+unicode-width = "0.2"
+
+[profile.release]
+lto = true
+strip = true
