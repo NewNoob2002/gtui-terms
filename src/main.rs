@@ -4,6 +4,7 @@ mod demo;
 mod esp;
 mod esptool;
 mod hooks;
+mod input;
 mod logfile;
 mod serial;
 mod session;
@@ -20,7 +21,9 @@ use clap::Parser;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyEventKind, poll, read,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TerminalEvent, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags, poll, read,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -309,10 +312,29 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // 以下两项是可选增强：旧版 Windows 控制台等不支持时忽略，仍可用 Alt+Enter/Ctrl+J 换行。
+    let _ = execute!(stdout, EnableBracketedPaste);
+    if matches!(
+        ratatui::crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    ) {
+        // 仅消歧义转义序列，使 Shift+Enter 可与 Enter 区分；不改变按键事件类型。
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        KEYBOARD_ENHANCED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
+static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn restore_terminal() -> io::Result<()> {
+    if KEYBOARD_ENHANCED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     let raw_result = disable_raw_mode();
     let screen_result = execute!(
         io::stdout(),
@@ -333,11 +355,22 @@ fn install_panic_hook() {
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     while !app.quit {
-        if poll(Duration::from_millis(16))? {
+        // 一次取完已到达的终端事件再重绘：快速键入或不支持 bracketed paste 的终端粘贴时，
+        // 避免每个字符都触发一次整屏绘制。上限防止持续输入饿死串口事件处理。
+        let mut timeout = Duration::from_millis(16);
+        for _ in 0..256 {
+            if !poll(timeout)? {
+                break;
+            }
+            timeout = Duration::ZERO;
             match read()? {
                 TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
                 TerminalEvent::Mouse(event) => app.on_mouse(event),
+                TerminalEvent::Paste(text) => app.on_paste(text),
                 _ => app.dirty = true,
+            }
+            if app.quit {
+                break;
             }
         }
         while let Ok(event) = app.rx.try_recv() {

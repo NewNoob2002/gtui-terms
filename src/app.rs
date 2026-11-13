@@ -23,6 +23,8 @@ pub const SCROLLBACK_ROWS: usize = 50_000;
 pub const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT: usize = 4096;
 const HISTORY_MAX: usize = 200;
+/// 历史文件按行存储；多行输入中的换行写成 U+001F（单元分隔符），用户无法直接键入。
+const HISTORY_NEWLINE: &str = "\u{1f}";
 pub const RAW_CAP: usize = 1024 * 1024;
 const PACKET_CAP: usize = 2000;
 /// Default idle gap that closes an RX packet; reads closer than this are one frame.
@@ -157,8 +159,9 @@ pub struct App {
     pub status: String,
     pub scrollback: Scrollback,
     pub assembler: Assembler,
-    pub input: Vec<char>,
-    pub cursor: usize,
+    pub input: crate::input::Editor,
+    /// 输入框文本区宽度（列），由 UI 绘制时更新，用于上下键在折行间移动。
+    pub input_width: u16,
     pub quit: bool,
     pub dirty: bool,
     pub show_timestamps: bool,
@@ -271,8 +274,8 @@ impl App {
             status: session_error.clone(),
             scrollback: Scrollback::new(SCROLLBACK_ROWS, SCROLLBACK_BYTES),
             assembler: Assembler::new(),
-            input: Vec::new(),
-            cursor: 0,
+            input: crate::input::Editor::new(MAX_INPUT),
+            input_width: 80,
             quit: false,
             dirty: true,
             show_timestamps,
@@ -1659,7 +1662,7 @@ impl App {
         self.history = text
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .map(str::to_string)
+            .map(|line| line.replace(HISTORY_NEWLINE, "\n"))
             .collect();
         let excess = self.history.len().saturating_sub(HISTORY_MAX);
         self.history.drain(..excess);
@@ -1681,7 +1684,7 @@ impl App {
         let body: String = self
             .history
             .iter()
-            .map(|line| format!("{line}\n"))
+            .map(|line| format!("{}\n", line.replace('\n', HISTORY_NEWLINE)))
             .collect();
         let _ = std::fs::write(path, body);
     }
@@ -1760,48 +1763,115 @@ impl App {
     }
 
     fn terminal_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::PageUp => self.scroll_page(true),
-            KeyCode::PageDown => self.scroll_page(false),
-            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_home(),
-            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_end(),
-            KeyCode::Esc => self.focus = Focus::Output,
-            KeyCode::Enter => self.submit(),
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.len()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
-            KeyCode::Up => self.history_prev(),
-            KeyCode::Down => self.history_next(),
-            KeyCode::Char(ch)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && self.input.len() < MAX_INPUT =>
-            {
-                self.input.insert(self.cursor, ch);
-                self.cursor += 1;
-                self.history_pos = None;
-                self.dirty = true;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let width = usize::from(self.input_width.max(1));
+        let edited = match key.code {
+            KeyCode::PageUp => {
+                self.scroll_page(true);
+                false
             }
-            _ => {}
+            KeyCode::PageDown => {
+                self.scroll_page(false);
+                false
+            }
+            KeyCode::Home if ctrl => {
+                self.scroll_home();
+                false
+            }
+            KeyCode::End if ctrl => {
+                self.scroll_end();
+                false
+            }
+            KeyCode::Esc => {
+                self.focus = Focus::Output;
+                false
+            }
+            // Shift/Alt+Enter 与 Ctrl+J 插入换行；不支持区分 Shift+Enter 的终端可用后两者。
+            KeyCode::Enter if shift || alt => self.input.insert('\n'),
+            KeyCode::Char('j') if ctrl => self.input.insert('\n'),
+            KeyCode::Enter => {
+                self.submit();
+                false
+            }
+            KeyCode::Backspace if ctrl || alt => self.input.delete_word_back(),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete(),
+            KeyCode::Left if ctrl || alt => {
+                self.input.word_left();
+                false
+            }
+            KeyCode::Right if ctrl || alt => {
+                self.input.word_right();
+                false
+            }
+            KeyCode::Left => {
+                self.input.left();
+                false
+            }
+            KeyCode::Right => {
+                self.input.right();
+                false
+            }
+            KeyCode::Home | KeyCode::Char('a') if key.code == KeyCode::Home || ctrl => {
+                self.input.home();
+                false
+            }
+            KeyCode::End | KeyCode::Char('e') if key.code == KeyCode::End || ctrl => {
+                self.input.end();
+                false
+            }
+            KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
+            KeyCode::Char('u') if ctrl => self.input.kill_to_line_start(),
+            KeyCode::Char('k') if ctrl => self.input.kill_to_line_end(),
+            KeyCode::Up => {
+                if !self.input.vertical(true, width) {
+                    self.history_prev();
+                }
+                false
+            }
+            KeyCode::Down => {
+                if !self.input.vertical(false, width) {
+                    self.history_next();
+                }
+                false
+            }
+            KeyCode::Char(ch) if !ctrl && !alt => self.input.insert(ch),
+            _ => false,
+        };
+        if edited {
+            self.history_pos = None;
         }
+        self.dirty = true;
     }
 
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            self.input.remove(self.cursor);
-            self.dirty = true;
+    /// 终端 bracketed paste：输入框获得整段文本（含换行），RAW 模式原样发送。
+    pub fn on_paste(&mut self, text: String) {
+        self.dirty = true;
+        if self.mode != Mode::Terminal
+            || self.help
+            || self.popup.is_some()
+            || self.settings_dialog.is_some()
+        {
+            return;
         }
-    }
-
-    fn delete(&mut self) {
-        if self.cursor < self.input.len() {
-            self.input.remove(self.cursor);
-            self.dirty = true;
+        if self.raw_mode {
+            if self.focus != Focus::Output {
+                self.send_bytes(text.into_bytes());
+            }
+            return;
+        }
+        if let Some(search) = &mut self.search_input {
+            search.extend(text.chars().filter(|ch| !ch.is_control()));
+            return;
+        }
+        self.focus = Focus::Input;
+        let wanted = text.chars().count();
+        let inserted = self.input.insert_str(&text);
+        self.history_pos = None;
+        if inserted < wanted {
+            self.status = format!("input limit {MAX_INPUT} chars: paste truncated");
         }
     }
 
@@ -1831,9 +1901,8 @@ impl App {
     }
 
     fn submit(&mut self) {
-        let text: String = self.input.iter().collect();
+        let text = self.input.text();
         self.input.clear();
-        self.cursor = 0;
         self.history_pos = None;
         if !text.is_empty() && self.history.last() != Some(&text) {
             self.history.push(text.clone());
@@ -1874,16 +1943,16 @@ impl App {
     }
 
     fn send_payload(&mut self, text: &str) {
-        let mut bytes = text.as_bytes().to_vec();
-        bytes.extend_from_slice(self.eol.bytes());
-        self.send_bytes(bytes);
+        self.send_bytes(payload_bytes(text, self.eol));
         if self.demo {
             let at = now_ms();
-            let cells = text
-                .chars()
-                .map(|ch| crate::term::scrollback::Cell::new(ch, PLAIN))
-                .collect();
-            self.scrollback.push(Row { cells, at });
+            for line in text.split('\n') {
+                let cells = line
+                    .chars()
+                    .map(|ch| crate::term::scrollback::Cell::new(ch, PLAIN))
+                    .collect();
+                self.scrollback.push(Row { cells, at });
+            }
             self.version += 1;
         }
     }
@@ -1936,6 +2005,13 @@ impl App {
     }
 
     pub fn execute(&mut self, text: &str) {
+        // 多行命令逐行执行，便于一次粘贴/输入一组 / 命令；多行数据整体发送。
+        if text.contains('\n') && text.starts_with('/') && !text.starts_with("//") {
+            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                self.execute(line);
+            }
+            return;
+        }
         if text.starts_with("//") {
             self.send_payload(&text[1..]);
         } else if text.starts_with('/') {
@@ -2245,8 +2321,7 @@ impl App {
             Some(pos) => pos - 1,
         };
         self.history_pos = Some(pos);
-        self.input = self.history[pos].chars().collect();
-        self.cursor = self.input.len();
+        self.input.set(&self.history[pos].clone());
         self.dirty = true;
     }
 
@@ -2254,12 +2329,11 @@ impl App {
         let Some(pos) = self.history_pos else { return };
         if pos + 1 < self.history.len() {
             self.history_pos = Some(pos + 1);
-            self.input = self.history[pos + 1].chars().collect();
+            self.input.set(&self.history[pos + 1].clone());
         } else {
             self.history_pos = None;
             self.input.clear();
         }
-        self.cursor = self.input.len();
         self.dirty = true;
     }
 
@@ -2294,7 +2368,7 @@ impl App {
 
     #[cfg(test)]
     pub fn input_text(&self) -> String {
-        self.input.iter().collect()
+        self.input.text()
     }
 }
 
@@ -2413,6 +2487,20 @@ fn retain_packet(
     }
     removed
 }
+/// 输入框文本转发送字节：内部换行与结尾都使用所选行尾；行尾为 none 时保留用户输入的 `\n`。
+fn payload_bytes(text: &str, eol: Eol) -> Vec<u8> {
+    let sep: &[u8] = if eol == Eol::None { b"\n" } else { eol.bytes() };
+    let mut bytes = Vec::with_capacity(text.len() + 2);
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            bytes.extend_from_slice(sep);
+        }
+        bytes.extend_from_slice(line.as_bytes());
+    }
+    bytes.extend_from_slice(eol.bytes());
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2657,6 +2745,44 @@ mod tests {
     }
 
     #[test]
+    fn multiline_payload_uses_selected_eol_and_commands_run_per_line() {
+        assert_eq!(payload_bytes("a\nb", Eol::CrLf), b"a\r\nb\r\n");
+        assert_eq!(payload_bytes("a\nb", Eol::Cr), b"a\rb\r");
+        assert_eq!(payload_bytes("a\nb", Eol::None), b"a\nb");
+        let mut app = app();
+        app.execute("/eol lf\n\n/timestamps on");
+        assert_eq!(app.eol, Eol::Lf);
+        assert!(app.show_timestamps);
+    }
+
+    #[test]
+    fn editing_shortcuts_and_multiline_history_round_trip() {
+        let mut app = app();
+        app.focus = Focus::Input;
+        typed(&mut app, "hello big world");
+        let ctrl = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+        app.on_key(ctrl('w'));
+        assert_eq!(app.input_text(), "hello big ");
+        app.on_key(ctrl('a'));
+        app.on_key(ctrl('k'));
+        assert_eq!(app.input_text(), "");
+        typed(&mut app, "x");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        typed(&mut app, "y");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.history.last().map(String::as_str), Some("x\ny"));
+
+        let dir = std::env::temp_dir().join(format!("gtui-ml-history-{}", now_ms()));
+        let path = dir.join("history");
+        app.save_history_to(&path);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("x\ny"));
+        let mut fresh = self::app();
+        fresh.load_history_from(&path);
+        assert_eq!(fresh.history.last().map(String::as_str), Some("x\ny"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn submit_without_port_reports_status() {
         let mut app = app();
         typed(&mut app, "at+ver?");
@@ -2732,7 +2858,7 @@ mod tests {
         fresh.load_history_from(&path);
         assert_eq!(fresh.history.last().map(String::as_str), Some("/filter e"));
         fresh.on_key(key(KeyCode::Up));
-        assert_eq!(fresh.input.iter().collect::<String>(), "/filter e");
+        assert_eq!(fresh.input.text(), "/filter e");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

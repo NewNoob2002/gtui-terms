@@ -168,11 +168,31 @@ fn draw_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// 输入框最多显示的文本行数，超出时在框内滚动。
+const INPUT_MAX_ROWS: usize = 8;
+/// 输入框文本前的提示符宽度（"› " 或续行缩进）。
+const INPUT_PROMPT: u16 = 2;
+
+fn input_height(app: &App, area: Rect) -> u16 {
+    // 太矮时退化为无边框单行，保证输出区仍可见。
+    if area.height < 8 {
+        return 1;
+    }
+    let width = area.width.saturating_sub(2 + INPUT_PROMPT);
+    let rows = if app.raw_mode || app.search_input.is_some() {
+        1
+    } else {
+        app.input.rows(usize::from(width)).len()
+    };
+    let cap = INPUT_MAX_ROWS.min(usize::from(area.height / 3).max(1));
+    u16::try_from(rows.clamp(1, cap)).unwrap_or(1) + 2
+}
+
 fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(u16::from(area.height >= 4)),
-        Constraint::Length(1),
+        Constraint::Length(input_height(app, area)),
     ])
     .split(area);
 
@@ -247,52 +267,147 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
         chunks[1],
     );
 
-    let (prompt, text): (Span, String) = if app.raw_mode {
+    draw_input(frame, app, chunks[2]);
+}
+
+fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == Focus::Input;
+    let accent = if app.raw_mode {
+        Color::Magenta
+    } else if app.search_input.is_some() {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    let inner = if area.height >= 3 {
+        let mode = if app.raw_mode {
+            " RAW ".to_string()
+        } else if app.search_input.is_some() {
+            " SEARCH ".to_string()
+        } else {
+            format!(" TX · {} ", app.eol.label().to_uppercase())
+        };
+        let hint = if app.raw_mode {
+            " Ctrl+] leave "
+        } else if app.search_input.is_some() {
+            " Enter find · Esc cancel "
+        } else {
+            " Enter send · Shift/Alt+Enter or Ctrl+J newline "
+        };
+        let border = if focused {
+            Style::default().fg(accent)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(border)
+            .title(Span::styled(mode, border.add_modifier(Modifier::BOLD)));
+        if focused && area.width > 60 {
+            block = block.title_bottom(Line::from(hint).right_aligned());
+        }
+        if !app.raw_mode && app.search_input.is_none() && !app.input.is_empty() {
+            let count = format!(" {} B ", app.input.text().len());
+            block = block.title(Line::from(count).right_aligned());
+        }
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
+    let text_width = inner.width.saturating_sub(INPUT_PROMPT);
+    app.input_width = text_width.max(1);
+    let prompt_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+
+    let (lines, cursor): (Vec<Line>, Option<(u16, u16)>) = if app.raw_mode {
         (
-            Span::raw(""),
-            "RAW — keys go to the device, Ctrl+] to leave".to_string(),
+            vec![Line::from(vec![
+                Span::styled("» ", prompt_style),
+                Span::styled(
+                    "keys go straight to the device",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])],
+            None,
+        )
+    } else if let Some(buf) = &app.search_input {
+        let text: String = buf.iter().collect();
+        let used: usize = buf.iter().map(|ch| crate::input::width_of(*ch)).sum();
+        (
+            vec![Line::from(vec![
+                Span::styled("/ ", prompt_style),
+                Span::raw(text),
+            ])],
+            Some((u16::try_from(used).unwrap_or(u16::MAX), 0)),
+        )
+    } else if app.input.is_empty() {
+        (
+            vec![Line::from(vec![
+                Span::styled("› ", prompt_style),
+                Span::styled(
+                    "type data to send, /help for commands",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])],
+            Some((0, 0)),
         )
     } else {
-        match &app.search_input {
-            Some(buf) => (Span::raw("/"), buf.iter().collect()),
-            None => (Span::raw("> "), app.input.iter().collect()),
-        }
+        let width = usize::from(text_width.max(1));
+        let rows = app.input.rows(width);
+        let (row, col) = app.input.cursor_position(width);
+        let visible = usize::from(inner.height.max(1));
+        let offset = row.saturating_sub(visible - 1);
+        let chars = app.input.chars();
+        let lines = rows
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible)
+            .map(|(index, visual)| {
+                let lead = if index == 0 {
+                    Span::styled("› ", prompt_style)
+                } else {
+                    Span::raw("  ")
+                };
+                let text: String = chars[visual.start..visual.end]
+                    .iter()
+                    .map(|ch| {
+                        if *ch == '\t' {
+                            "    ".to_string()
+                        } else {
+                            ch.to_string()
+                        }
+                    })
+                    .collect();
+                Line::from(vec![lead, Span::raw(text)])
+            })
+            .collect();
+        (
+            lines,
+            Some((
+                u16::try_from(col).unwrap_or(u16::MAX),
+                u16::try_from(row - offset).unwrap_or(0),
+            )),
+        )
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![prompt, Span::raw(text)])).style(
-            if app.focus == Focus::Input {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
-            },
-        ),
-        chunks[2],
-    );
+    frame.render_widget(Paragraph::new(lines), inner);
 
-    if !app.raw_mode
-        && app.focus == Focus::Input
+    if let Some((x, y)) = cursor
+        && focused
         && !app.help
         && app.popup.is_none()
         && app.settings_dialog.is_none()
-        && chunks[2].width > 0
-        && chunks[2].height > 0
+        && inner.width > 0
+        && inner.height > 0
     {
-        let prompt_width = if app.search_input.is_some() { 1 } else { 2 };
-        let used: usize = match &app.search_input {
-            Some(buf) => buf
-                .iter()
-                .map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0))
-                .sum(),
-            None => app.input[..app.cursor]
-                .iter()
-                .map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0))
-                .sum(),
-        };
-        let cursor_x = u16::try_from(prompt_width + used).unwrap_or(u16::MAX);
-        let cursor_x = cursor_x.min(chunks[2].width.saturating_sub(1));
-        frame.set_cursor_position((chunks[2].x + cursor_x, chunks[2].y));
+        let x = (INPUT_PROMPT + x).min(inner.width.saturating_sub(1));
+        let y = y.min(inner.height - 1);
+        frame.set_cursor_position((inner.x + x, inner.y + y));
     }
 }
+
 fn draw_streams(frame: &mut Frame, app: &mut App, area: Rect) {
     let split = area.width >= 72 || !app.tx_packets.is_empty();
     let panes = Layout::horizontal([
@@ -538,7 +653,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         ));
     }
     text.extend([
-        "Line mode: Enter sends with selected EOL; Up/Down recalls saved history.",
+        "Line mode: Enter sends with selected EOL; Up/Down move between input rows, then recall history.",
+        "Newline in input: Shift+Enter (if the terminal reports it), Alt+Enter or Ctrl+J; pasted text keeps its lines.",
+        "Editing: Ctrl+A/E line start/end, Ctrl+W or Ctrl+Backspace delete word, Ctrl+U/K delete to start/end, Ctrl+Left/Right word.",
+        "Multi-line data is sent with the selected EOL between and after lines; multi-line /commands run line by line.",
         "//help sends literal /help; a single leading slash runs a local command.",
         "/help opens this help | /settings opens serial settings | /ports opens ports.",
         "/esp opens ESP-IDF tools | /elf build/app.elf loads matching debug symbols.",
@@ -1284,7 +1402,35 @@ mod tests {
         let text = rendered(&mut app, 40, 8);
         assert!(text.contains("hello"));
         assert!(text.contains("world"));
-        assert!(text.contains("> ping"));
+        assert!(text.contains("› ping"));
+    }
+
+    #[test]
+    fn input_box_grows_with_manual_newlines_and_shows_mode() {
+        let mut app = app();
+        app.focus = Focus::Input;
+        for ch in "AT+CMD".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        app.on_paste("line3\r\nline4".to_string());
+        assert_eq!(app.input_text(), "AT+CMD\n\nline3\nline4");
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("TX · CRLF"), "{text}");
+        assert!(text.contains("› AT+CMD"), "{text}");
+        assert!(text.contains("  line3"), "{text}");
+        assert!(text.contains("  line4"), "{text}");
+        let input = app
+            .hits_ui
+            .iter()
+            .find_map(|(area, hit)| matches!(hit, Hit::Input).then_some(*area))
+            .unwrap();
+        assert_eq!(input.height, 4 + 2);
+        // 光标在末行时 Up 先在输入框内移动而不是翻历史
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(app.input_text(), "AT+CMD\n\nline3!\nline4");
     }
 
     #[test]
