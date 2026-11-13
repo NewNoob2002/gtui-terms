@@ -27,6 +27,9 @@ pub struct Assembler {
     state: State,
     csi: Vec<u8>,
     done: Vec<Vec<Cell>>,
+    /// 单独的 CR 视为换行（部分设备只发 `\r`）；CRLF 仍只换一行。
+    cr_newline: bool,
+    after_cr: bool,
 }
 
 impl Default for Assembler {
@@ -36,6 +39,15 @@ impl Default for Assembler {
 }
 
 impl Assembler {
+    pub fn cr_newline(&self) -> bool {
+        self.cr_newline
+    }
+
+    pub fn set_cr_newline(&mut self, on: bool) {
+        self.cr_newline = on;
+        self.after_cr = false;
+    }
+
     pub fn new() -> Self {
         Self {
             current: Vec::new(),
@@ -47,6 +59,8 @@ impl Assembler {
             state: State::Ground,
             csi: Vec::new(),
             done: Vec::new(),
+            cr_newline: false,
+            after_cr: false,
         }
     }
 
@@ -96,6 +110,7 @@ impl Assembler {
         self.cursor = 0;
         self.style = PLAIN;
         self.state = State::Ground;
+        self.after_cr = false;
     }
 
     fn ground(&mut self, byte: u8) {
@@ -131,8 +146,14 @@ impl Assembler {
             }
             return;
         }
+        let after_cr = std::mem::take(&mut self.after_cr);
         match byte {
+            b'\n' if self.cr_newline && after_cr => {}
             b'\n' => self.newline(),
+            b'\r' if self.cr_newline => {
+                self.newline();
+                self.after_cr = true;
+            }
             b'\r' => self.cursor = 0,
             0x08 => self.cursor = self.cursor.saturating_sub(1),
             b'\t' => {

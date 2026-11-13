@@ -222,6 +222,10 @@ pub struct App {
     pub esp_status: String,
     pub raw_mode: bool,
     pub eol: Eol,
+    /// 输入框按 HEX 解析发送（不追加行尾），Ctrl+X 切换。
+    pub tx_hex: bool,
+    /// TEXT 模式解析 `\r \n \t \0 \\ \xHH` 转义。
+    pub tx_escapes: bool,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub rx_rate: u64,
@@ -335,6 +339,8 @@ impl App {
             esp_status: "Listening for panic backtraces and UART base64 coredumps".to_string(),
             raw_mode: false,
             eol: Eol::CrLf,
+            tx_hex: false,
+            tx_escapes: false,
             rx_bytes: 0,
             tx_bytes: 0,
             rx_rate: 0,
@@ -1461,6 +1467,14 @@ impl App {
                 self.toggle_timestamps();
                 return;
             }
+            KeyCode::Char('x') if ctrl && !self.raw_mode => {
+                self.execute("/txmode");
+                return;
+            }
+            KeyCode::Char('r') if ctrl && !self.raw_mode => {
+                self.cycle_eol();
+                return;
+            }
             KeyCode::Char('n') if ctrl && !self.raw_mode => {
                 self.step_hit(true);
                 return;
@@ -1875,6 +1889,16 @@ impl App {
         }
     }
 
+    fn cycle_eol(&mut self) {
+        self.eol = match self.eol {
+            Eol::CrLf => Eol::Lf,
+            Eol::Lf => Eol::Cr,
+            Eol::Cr => Eol::None,
+            Eol::None => Eol::CrLf,
+        };
+        self.status = format!("line ending {}", self.eol.label());
+    }
+
     fn clear(&mut self) {
         self.scrollback.clear();
         self.assembler.reset();
@@ -1902,6 +1926,16 @@ impl App {
 
     fn submit(&mut self) {
         let text = self.input.text();
+        if self.tx_hex
+            && !text.starts_with('/')
+            && !text.trim().is_empty()
+            && let Err(err) = parse_hex(&text)
+        {
+            // 保留输入，方便修改后重发
+            self.status = format!("HEX: {err}");
+            self.dirty = true;
+            return;
+        }
         self.input.clear();
         self.history_pos = None;
         if !text.is_empty() && self.history.last() != Some(&text) {
@@ -1943,7 +1977,7 @@ impl App {
     }
 
     fn send_payload(&mut self, text: &str) {
-        self.send_bytes(payload_bytes(text, self.eol));
+        self.send_bytes(payload_bytes(text, self.eol, self.tx_escapes));
         if self.demo {
             let at = now_ms();
             for line in text.split('\n') {
@@ -2012,7 +2046,18 @@ impl App {
             }
             return;
         }
-        if text.starts_with("//") {
+        if self.tx_hex && !text.starts_with('/') {
+            if !text.trim().is_empty() {
+                match parse_hex(text) {
+                    Ok(bytes) => {
+                        let count = bytes.len();
+                        self.send_bytes(bytes);
+                        self.status = format!("sent {count} byte(s) HEX");
+                    }
+                    Err(err) => self.status = format!("HEX: {err}"),
+                }
+            }
+        } else if text.starts_with("//") {
             self.send_payload(&text[1..]);
         } else if text.starts_with('/') {
             self.command(text);
@@ -2175,6 +2220,90 @@ impl App {
                 None => self.status = "usage: /eol crlf|lf|cr|none".to_string(),
             }
             return;
+        }
+        if let Some(arg) = rest.strip_prefix("txmode") {
+            match arg.trim() {
+                "" => self.tx_hex = !self.tx_hex,
+                "hex" => self.tx_hex = true,
+                "text" => self.tx_hex = false,
+                _ => {
+                    self.status = "usage: /txmode [text|hex]".to_string();
+                    return;
+                }
+            }
+            self.status = format!("send mode {}", if self.tx_hex { "HEX" } else { "TEXT" });
+            return;
+        }
+        if let Some(arg) = rest.strip_prefix("escapes") {
+            match arg.trim() {
+                "" => self.tx_escapes = !self.tx_escapes,
+                "on" => self.tx_escapes = true,
+                "off" => self.tx_escapes = false,
+                _ => {
+                    self.status = "usage: /escapes [on|off]".to_string();
+                    return;
+                }
+            }
+            self.status = if self.tx_escapes {
+                "text escapes on: \\r \\n \\t \\0 \\\\ \\xHH".to_string()
+            } else {
+                "text escapes off".to_string()
+            };
+            return;
+        }
+        if let Some(arg) = rest.strip_prefix("rxcr") {
+            let on = match arg.trim() {
+                "" => !self.assembler.cr_newline(),
+                "newline" | "on" => true,
+                "overwrite" | "off" => false,
+                _ => {
+                    self.status = "usage: /rxcr [newline|overwrite]".to_string();
+                    return;
+                }
+            };
+            self.assembler.set_cr_newline(on);
+            self.status = if on {
+                "RX: lone CR starts a new line".to_string()
+            } else {
+                "RX: CR returns to line start (progress bars)".to_string()
+            };
+            return;
+        }
+        if rest == "counters reset" {
+            self.rx_bytes = 0;
+            self.tx_bytes = 0;
+            self.rx_rate = 0;
+            self.rate_mark = (std::time::Instant::now(), 0);
+            self.status = "RX/TX counters reset".to_string();
+            return;
+        }
+        for name in ["dtr", "rts"] {
+            if let Some(arg) = rest.strip_prefix(name)
+                && (arg.is_empty() || arg.starts_with(' '))
+            {
+                let level = match arg.trim() {
+                    "on" | "1" => true,
+                    "off" | "0" => false,
+                    _ => {
+                        self.status = format!("usage: /{name} on|off");
+                        return;
+                    }
+                };
+                let step = if name == "dtr" {
+                    crate::serial::reset::Step::Dtr(level)
+                } else {
+                    crate::serial::reset::Step::Rts(level)
+                };
+                self.queue_sequence(vec![step]);
+                if self.writes.is_some() {
+                    self.status = format!(
+                        "{} {}",
+                        name.to_uppercase(),
+                        if level { "on" } else { "off" }
+                    );
+                }
+                return;
+            }
         }
         if let Some(arg) = rest.strip_prefix("hex ") {
             match parse_hex(arg) {
@@ -2398,17 +2527,31 @@ fn elf_sha256(path: &std::path::Path) -> Option<String> {
     Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn parse_hex(text: &str) -> Result<Vec<u8>, String> {
+pub fn parse_hex(text: &str) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    for token in text.split([' ', ',']) {
+    for token in text.split([' ', ',', '\n', '\t']) {
         if token.is_empty() {
             continue;
         }
         let clean = token.trim_start_matches("0x").trim_start_matches("0X");
-        if clean.len() > 2 || !clean.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        // 允许连续书写（AA55）；一或两位为一个字节，更长时必须成对。
+        if clean.is_empty()
+            || (clean.len() > 2 && clean.len() % 2 == 1)
+            || !clean.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
             return Err(format!("{token}: use two hex digits per byte"));
         }
-        bytes.push(u8::from_str_radix(clean, 16).map_err(|_| format!("{token}: bad byte"))?);
+        let pairs: Vec<&str> = if clean.len() <= 2 {
+            vec![clean]
+        } else {
+            (0..clean.len())
+                .step_by(2)
+                .map(|at| &clean[at..at + 2])
+                .collect()
+        };
+        for pair in pairs {
+            bytes.push(u8::from_str_radix(pair, 16).map_err(|_| format!("{token}: bad byte"))?);
+        }
     }
     if bytes.is_empty() {
         return Err("usage: /hex 01 0d 0a".to_string());
@@ -2487,15 +2630,51 @@ fn retain_packet(
     }
     removed
 }
+/// 解析 TEXT 模式转义；无法识别的转义保持原样，便于发送字面反斜杠。
+fn unescape(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' || index + 1 >= bytes.len() {
+            out.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let (value, used) = match bytes[index + 1] {
+            b'r' => (b'\r', 2),
+            b'n' => (b'\n', 2),
+            b't' => (b'\t', 2),
+            b'0' => (0, 2),
+            b'\\' => (b'\\', 2),
+            b'x' => match text
+                .get(index + 2..index + 4)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                Some(value) => (value, 4),
+                None => (b'\\', 1),
+            },
+            _ => (b'\\', 1),
+        };
+        out.push(value);
+        index += used;
+    }
+    out
+}
+
 /// 输入框文本转发送字节：内部换行与结尾都使用所选行尾；行尾为 none 时保留用户输入的 `\n`。
-fn payload_bytes(text: &str, eol: Eol) -> Vec<u8> {
+fn payload_bytes(text: &str, eol: Eol, escapes: bool) -> Vec<u8> {
     let sep: &[u8] = if eol == Eol::None { b"\n" } else { eol.bytes() };
     let mut bytes = Vec::with_capacity(text.len() + 2);
     for (index, line) in text.split('\n').enumerate() {
         if index > 0 {
             bytes.extend_from_slice(sep);
         }
-        bytes.extend_from_slice(line.as_bytes());
+        if escapes {
+            bytes.extend(unescape(line));
+        } else {
+            bytes.extend_from_slice(line.as_bytes());
+        }
     }
     bytes.extend_from_slice(eol.bytes());
     bytes
@@ -2746,13 +2925,67 @@ mod tests {
 
     #[test]
     fn multiline_payload_uses_selected_eol_and_commands_run_per_line() {
-        assert_eq!(payload_bytes("a\nb", Eol::CrLf), b"a\r\nb\r\n");
-        assert_eq!(payload_bytes("a\nb", Eol::Cr), b"a\rb\r");
-        assert_eq!(payload_bytes("a\nb", Eol::None), b"a\nb");
+        assert_eq!(payload_bytes("a\nb", Eol::CrLf, false), b"a\r\nb\r\n");
+        assert_eq!(payload_bytes("a\nb", Eol::Cr, false), b"a\rb\r");
+        assert_eq!(payload_bytes("a\nb", Eol::None, false), b"a\nb");
         let mut app = app();
         app.execute("/eol lf\n\n/timestamps on");
         assert_eq!(app.eol, Eol::Lf);
         assert!(app.show_timestamps);
+    }
+
+    #[test]
+    fn hex_mode_escapes_and_eol_cycle_shape_sent_bytes() {
+        let mut app = app();
+        app.demo = true;
+        app.focus = Focus::Input;
+        let ctrl = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+        let last_tx = |app: &App| app.tx_packets.back().map(|p| p.bytes.clone());
+
+        app.on_key(ctrl('x'));
+        assert!(app.tx_hex);
+        typed(&mut app, "AA 5");
+        typed(&mut app, "5zz");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.status.starts_with("HEX:"), "{}", app.status);
+        assert_eq!(app.input_text(), "AA 55zz", "invalid HEX input is kept");
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(last_tx(&app), Some(vec![0xaa, 0x55]), "no EOL in HEX mode");
+        app.on_key(ctrl('x'));
+        assert!(!app.tx_hex);
+
+        app.on_key(ctrl('r'));
+        assert_eq!(app.eol, Eol::Lf);
+        app.execute("/escapes on");
+        typed(&mut app, "a\\x01\\r\\q");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(last_tx(&app), Some(b"a\x01\r\\q\n".to_vec()));
+        for _ in 0..3 {
+            app.on_key(ctrl('r'));
+        }
+        assert_eq!(app.eol, Eol::CrLf);
+        app.execute("/counters reset");
+        assert_eq!((app.rx_bytes, app.tx_bytes), (0, 0));
+        app.execute("/dtr maybe");
+        assert_eq!(app.status, "usage: /dtr on|off");
+    }
+
+    #[test]
+    fn rx_lone_cr_can_start_new_lines() {
+        let mut app = app();
+        app.execute("/rxcr newline");
+        app.on_event(Event::Data(b"one\rtwo\r".to_vec()));
+        app.on_event(Event::Data(b"\nthree\r\n".to_vec()));
+        let rows: Vec<String> = app
+            .scrollback
+            .iter()
+            .map(|row| row.cells.iter().map(|cell| cell.ch).collect())
+            .collect();
+        assert_eq!(rows, ["one", "two", "three"]);
+        app.execute("/rxcr overwrite");
+        assert!(!app.assembler.cr_newline());
     }
 
     #[test]
@@ -2934,6 +3167,12 @@ mod tests {
         assert_eq!(parse_hex("0x41,42").unwrap(), vec![0x41, 0x42]);
         assert!(parse_hex("zz").is_err());
         assert!(parse_hex("123").is_err());
+        assert_eq!(
+            parse_hex("AA55 0d\n0a").unwrap(),
+            vec![0xaa, 0x55, 0x0d, 0x0a]
+        );
+        assert_eq!(parse_hex("a").unwrap(), vec![0x0a]);
+        assert!(parse_hex("AA5").is_err());
         assert!(parse_hex("  ").is_err());
     }
 

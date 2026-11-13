@@ -237,6 +237,9 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
         " | rx {} B {} B/s tx {} B",
         app.rx_bytes, app.rx_rate, app.tx_bytes
     ));
+    if app.assembler.cr_newline() {
+        status.push_str(" | rx CR=newline");
+    }
     if app.eol != Eol::CrLf {
         status.push_str(&format!(" | eol {}", app.eol.label()));
     }
@@ -284,15 +287,21 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
             " RAW ".to_string()
         } else if app.search_input.is_some() {
             " SEARCH ".to_string()
+        } else if app.tx_hex {
+            " TX · HEX ".to_string()
         } else {
-            format!(" TX · {} ", app.eol.label().to_uppercase())
+            format!(
+                " TX · {} · {} ",
+                if app.tx_escapes { "TEXT+ESC" } else { "TEXT" },
+                app.eol.label().to_uppercase()
+            )
         };
         let hint = if app.raw_mode {
             " Ctrl+] leave "
         } else if app.search_input.is_some() {
             " Enter find · Esc cancel "
         } else {
-            " Enter send · Shift/Alt+Enter or Ctrl+J newline "
+            " Enter send · Alt+Enter newline · ^X hex · ^R eol "
         };
         let border = if focused {
             Style::default().fg(accent)
@@ -308,7 +317,15 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
             block = block.title_bottom(Line::from(hint).right_aligned());
         }
         if !app.raw_mode && app.search_input.is_none() && !app.input.is_empty() {
-            let count = format!(" {} B ", app.input.text().len());
+            let text = app.input.text();
+            let count = if app.tx_hex && !text.starts_with('/') {
+                match crate::app::parse_hex(&text) {
+                    Ok(bytes) => Span::raw(format!(" {} B ", bytes.len())),
+                    Err(_) => Span::styled(" invalid hex ", Style::default().fg(Color::Red)),
+                }
+            } else {
+                Span::raw(format!(" {} B ", text.len()))
+            };
             block = block.title(Line::from(count).right_aligned());
         }
         let inner = block.inner(area);
@@ -657,6 +674,9 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         "Newline in input: Shift+Enter (if the terminal reports it), Alt+Enter or Ctrl+J; pasted text keeps its lines.",
         "Editing: Ctrl+A/E line start/end, Ctrl+W or Ctrl+Backspace delete word, Ctrl+U/K delete to start/end, Ctrl+Left/Right word.",
         "Multi-line data is sent with the selected EOL between and after lines; multi-line /commands run line by line.",
+        "Ctrl+X or /txmode [text|hex] toggles HEX send (AA55 or 0xAA,0x55; no EOL added); Ctrl+R cycles EOL.",
+        "/escapes [on|off] parses \\r \\n \\t \\0 \\\\ \\xHH in TEXT sends | /rxcr [newline|overwrite] handles lone CR.",
+        "/dtr on|off, /rts on|off set modem lines | /counters reset zeroes RX/TX byte totals.",
         "//help sends literal /help; a single leading slash runs a local command.",
         "/help opens this help | /settings opens serial settings | /ports opens ports.",
         "/esp opens ESP-IDF tools | /elf build/app.elf loads matching debug symbols.",
@@ -1417,7 +1437,7 @@ mod tests {
         app.on_paste("line3\r\nline4".to_string());
         assert_eq!(app.input_text(), "AT+CMD\n\nline3\nline4");
         let text = rendered(&mut app, 80, 24);
-        assert!(text.contains("TX · CRLF"), "{text}");
+        assert!(text.contains("TX · TEXT · CRLF"), "{text}");
         assert!(text.contains("› AT+CMD"), "{text}");
         assert!(text.contains("  line3"), "{text}");
         assert!(text.contains("  line4"), "{text}");
