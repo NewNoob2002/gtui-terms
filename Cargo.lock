@@ -700,8 +700,7 @@ checksum = "911aadae41ec99104efa865bd0b6e486b4b735999f9b571963748a46d16495ab"
 [[package]]
 name = "espflash"
 version = "4.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "470053a0b1671c0d2c47b69000daceb8d79cedf0ad0b13990bf137ef8ddbe5cb"
+source = "git+https://github.com/NewNoob2002/espflash?rev=46c65f0#46c65f09aae4cf0ac4ba0552a507e74362e49fba"
 dependencies = [
  "base64 0.23.1",
  "bitflags 2.13.2",

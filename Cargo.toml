@@ -10,7 +10,8 @@ addr2line = "0.27"
 base64 = "0.22.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
-espflash = { version = "4.7.0", default-features = false, features = ["serialport"] }
+# Fork with ESP32 connect fixes; pinned so builds stay reproducible.
+espflash = { git = "https://github.com/NewNoob2002/espflash", rev = "46c65f0", default-features = false, features = ["serialport"] }
 ratatui = "0.30.2"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }

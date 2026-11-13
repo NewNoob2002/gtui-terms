@@ -73,7 +73,7 @@ Open **ESP** on the toolbar or run `/esp`. The panel shows the device, active EL
    - **One-click flash**: `/esp flash <path>` or the ESP panel's *Flash firmware* prompt (pre-filled with `build` when `./build/flasher_args.json` exists). A directory containing `flasher_args.json` (an ESP-IDF `build/` folder) writes exactly the listed images at their offsets. An `.elf` file (or a directory with a single `.elf`) is converted to an app image; `bootloader/bootloader.bin` and `partition_table/partition-table.bin` beside it are used when present, otherwise espflash's bundled bootloader and a generated default partition table are written, so no partition table has to be prepared by hand. The ELF path writes the detected Flash size into the image header.
    - `/esp write-flash <offset> <file> ...` writes raw images; `/esp erase-flash` erases the chip.
    - Erase and write run at `flash_baud` (default 460800, `/esp baud <n>` or config `flash_baud`), read-only queries at 115200. Destructive actions display the target, image offsets, and resolved paths before explicit confirmation; quoted paths with spaces and multiple images are supported. Invalid, empty, overlapping, or out-of-range image inputs are rejected before execution.
-   - Classic ESP32 ROMs do not answer espflash 4.7's security-info probe, so connecting takes about 6 s (Python esptool takes about 2 s).
+   - The library comes from a [maintained espflash fork](https://github.com/NewNoob2002/espflash) (pinned by git revision). It skips the security-info probe that the classic ESP32 ROM never answers, cutting connect time from about 6 s to about 2 s.
 
 The clickable toolbar and separate configuration/action dialogs follow the interaction pattern of [termapy](https://github.com/hucker/termapy).
 

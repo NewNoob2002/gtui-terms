@@ -383,11 +383,7 @@ pub fn run(
 
 fn execute(invocation: &Invocation, on_output: &impl Fn(String)) -> Result<(), String> {
     let destructive = invocation.operation.destructive();
-    // espflash 4.7 在 ESP32 等旧 ROM 上会等待两次不支持命令的超时，连接约需 6 秒。
-    on_output(format!(
-        "connecting to {}… (classic ESP32 ROM takes about 6 s)",
-        invocation.port
-    ));
+    on_output(format!("connecting to {}…", invocation.port));
     let serial = serialport::new(&invocation.port, 115_200)
         .flow_control(serialport::FlowControl::None)
         .open_native()
