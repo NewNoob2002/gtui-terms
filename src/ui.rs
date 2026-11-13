@@ -196,7 +196,7 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
         " | follow"
     });
     if app.show_packets {
-        status.push_str(" | packets");
+        status.push_str(&format!(" | packets {}ms", app.packet_gap_ms));
     }
     if app.view == View::Hex {
         status.push_str(" | HEX (F8)");
@@ -547,7 +547,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         "/esp write-flash 0x1000 \"bootloader.bin\" 0x10000 \"app.bin\" previews actual image paths and offsets before confirmation.",
         "/confirm executes the pending destructive operation; /cancel discards it. Install esptool in Python or set GTUI_ESPTOOL_PYTHON.",
         "/save [path] exports the full session; existing files are never overwritten. Records contain UTC time, RX/TX/TOOL, exact HEX and escaped text.",
-        "/lock on|off freezes/resumes viewport | /timestamps on|off | /packets on|off.",
+        "/lock on|off freezes/resumes viewport | /timestamps on|off | /packets on|off | /packets gap <ms>.",
         "RX is left, confirmed TX is right. Packets are serial read/write chunks, not protocol frames. Mouse wheel scrolls each pane.",
         "/eol crlf|lf|cr|none changes the line ending; example: /eol lf.",
         "/hex 01 0d 0a sends exact bytes without adding EOL (also accepts 0x41,42).",
@@ -1148,17 +1148,80 @@ mod tests {
                 app.execute("/packets on");
             }
             for index in 0..20 {
-                app.on_event(Event::Data(format!("row-{index:02}\n").into_bytes()));
+                app.on_event(Event::Received {
+                    at: index * 100,
+                    bytes: format!("row-{index:02}\n").into_bytes(),
+                });
             }
             let before = pane(&mut app, false);
             app.execute("/lock on");
             for index in 20..23 {
-                app.on_event(Event::Data(format!("row-{index:02}\n").into_bytes()));
+                app.on_event(Event::Received {
+                    at: index * 100,
+                    bytes: format!("row-{index:02}\n").into_bytes(),
+                });
             }
             assert_eq!(pane(&mut app, false), before);
             app.execute("/lock off");
             assert!(pane(&mut app, false).contains("row-22"));
         }
+    }
+
+    #[test]
+    fn packet_view_frames_rx_by_idle_gap() {
+        let mut app = app();
+        app.execute("/packets on");
+        // 一行日志被驱动拆成 32B + 10B 两次 read，间隔 2ms：应合并为一个包
+        app.on_event(Event::Received {
+            at: 1_000,
+            bytes: b"I (11374) hil_peer: TX id=0041 l".to_vec(),
+        });
+        app.on_event(Event::Received {
+            at: 1_002,
+            bytes: b"ength=32\r\n".to_vec(),
+        });
+        // 超过 20ms 空闲后到达：新包
+        app.on_event(Event::Received {
+            at: 1_100,
+            bytes: b"next\r\n".to_vec(),
+        });
+        let rx = pane(&mut app, false);
+        assert!(
+            rx.contains("RX 42B I (11374) hil_peer: TX id=0041 length=32\\r\\n"),
+            "{rx}"
+        );
+        assert!(rx.contains("RX 6B next"), "{rx}");
+        assert_eq!(app.rx_packets.len(), 2);
+
+        app.execute("/packets gap 0");
+        app.on_event(Event::Received {
+            at: 1_101,
+            bytes: b"a".to_vec(),
+        });
+        app.on_event(Event::Received {
+            at: 1_101,
+            bytes: b"b".to_vec(),
+        });
+        assert_eq!(app.rx_packets.len(), 4);
+        app.execute("/packets gap nope");
+        assert!(app.status.starts_with("usage: /packets gap"));
+        assert_eq!(app.packet_gap_ms, 0);
+    }
+
+    #[test]
+    fn merged_packets_are_capped_and_tx_never_merges() {
+        let mut app = app();
+        for index in 0..5u64 {
+            app.on_event(Event::Received {
+                at: index,
+                bytes: vec![b'x'; 1024],
+            });
+        }
+        let sizes: Vec<_> = app.rx_packets.iter().map(|p| p.bytes.len()).collect();
+        assert_eq!(sizes, vec![4096, 1024]);
+        app.on_event(Event::Written(b"one".to_vec()));
+        app.on_event(Event::Written(b"two".to_vec()));
+        assert_eq!(app.tx_packets.len(), 2);
     }
 
     #[test]

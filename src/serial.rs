@@ -31,7 +31,14 @@ pub enum Command {
 
 #[derive(Debug)]
 pub enum Event {
+    /// Received bytes stamped on arrival in the UI thread (demo, tests).
     Data(Vec<u8>),
+    /// Received bytes stamped by the reader thread right after `read()` returned,
+    /// so idle-gap packet framing is not quantized by the UI poll interval.
+    Received {
+        at: u64,
+        bytes: Vec<u8>,
+    },
     Written(Vec<u8>),
     WriteFailed(String),
     ToolOutput(String),
@@ -270,7 +277,13 @@ pub fn spawn(
                         match port.read(&mut buf) {
                             Ok(0) => {}
                             Ok(n) => {
-                                if tx.send(Event::Data(buf[..n].to_vec())).is_err() {
+                                if tx
+                                    .send(Event::Received {
+                                        at: crate::app::now_ms(),
+                                        bytes: buf[..n].to_vec(),
+                                    })
+                                    .is_err()
+                                {
                                     return;
                                 }
                             }

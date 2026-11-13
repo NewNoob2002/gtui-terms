@@ -39,7 +39,7 @@ The toolbar provides **Ports**, **Settings**, **Actions**, **ESP**, **Help**, **
 
 Keys: `F1` help, `F2` line/raw toggle, `F3` settings, `F4` actions, `F5` reset, `F6` bootloader, `F7` search (prefix the query with `re:` for a regex), `F8` hex view, `Ctrl+O` ports, `PageUp/PageDown` scroll, `Ctrl+Home/Ctrl+End` jump to oldest / follow the tail, `Ctrl+N/Ctrl+P` next/previous search hit, `Ctrl+T` timestamps, `Ctrl+S` save session, `Ctrl+B` or Scroll Lock freeze/resume output, `Ctrl+L` clear, `Ctrl+Q` quit. Pending writes and active esptool operations must finish before quitting. In raw mode `Ctrl+]` returns to line mode.
 
-Line commands: `/help`, `/ports`, `/settings`, `/esp`, `/elf <path>`, `/save [path]`, `/lock on|off`, `/timestamps on|off`, `/packets on|off`, `/reset`, `/boot` (or `/bootloader`), `/seq D0 R1 W0.5` (custom DTR/RTS steps, `W` in seconds), `/eol crlf|lf|cr|none`, `/hex 01 0d`, `/filter i,w,e` (show only the listed levels) or `/filter all`, `/repeat <ms> <count|0> <text>`, `/stop`, `/macro <name> <key> <text>`, `/hook <name>`, `/hooks`, `/quit`. `//text` sends a literal leading slash. Omitting `on|off` toggles Lock, Timestamps, or Packets.
+Line commands: `/help`, `/ports`, `/settings`, `/esp`, `/elf <path>`, `/save [path]`, `/lock on|off`, `/timestamps on|off`, `/packets on|off`, `/packets gap <ms>` (idle gap that closes an RX packet, default 20, `0` = one packet per read), `/reset`, `/boot` (or `/bootloader`), `/seq D0 R1 W0.5` (custom DTR/RTS steps, `W` in seconds), `/eol crlf|lf|cr|none`, `/hex 01 0d`, `/filter i,w,e` (show only the listed levels) or `/filter all`, `/repeat <ms> <count|0> <text>`, `/stop`, `/macro <name> <key> <text>`, `/hook <name>`, `/hooks`, `/quit`. `//text` sends a literal leading slash. Omitting `on|off` toggles Lock, Timestamps, or Packets.
 
 The status bar shows the frame format (`921600 baud 8N1`), RX/TX byte totals with a 500 ms RX rate, dropped lines, and the active filter. Command history is kept in `%APPDATA%\gtui-terms\history.txt` (or `$XDG_CONFIG_HOME/gtui-terms/history.txt`). If no `--elf` is given, `build/*.elf` is picked up automatically.
 
@@ -79,6 +79,7 @@ Looked up as `./.gtui-terms.toml`, then `%APPDATA%\gtui-terms\config.toml` (or `
 port = "COM4"
 baud = 921600
 timestamps = true
+packet_gap_ms = 20   # idle gap that closes an RX packet in packet view; 0 = one packet per read
 elf = "build/app.elf"
 
 [[macros]]

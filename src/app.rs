@@ -25,10 +25,27 @@ const MAX_INPUT: usize = 4096;
 const HISTORY_MAX: usize = 200;
 pub const RAW_CAP: usize = 1024 * 1024;
 const PACKET_CAP: usize = 2000;
+/// Default idle gap that closes an RX packet; reads closer than this are one frame.
+pub const PACKET_GAP_MS: u64 = 20;
+/// Upper bound for one merged RX packet so a continuous stream still splits.
+const PACKET_MAX_BYTES: usize = 4096;
 
 pub struct Packet {
+    /// Arrival time of the first byte.
     pub at: u64,
+    /// Arrival time of the latest chunk merged into this packet.
+    pub last: u64,
     pub bytes: Vec<u8>,
+}
+
+impl Packet {
+    fn new(at: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            at,
+            last: at,
+            bytes,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -146,6 +163,8 @@ pub struct App {
     pub dirty: bool,
     pub show_timestamps: bool,
     pub show_packets: bool,
+    /// Idle gap (ms) that closes an RX packet; 0 keeps every read as its own packet.
+    pub packet_gap_ms: u64,
     pub scroll_locked: bool,
     pub rx_packets: VecDeque<Packet>,
     pub tx_packets: VecDeque<Packet>,
@@ -257,6 +276,7 @@ impl App {
             quit: false,
             dirty: true,
             show_timestamps,
+            packet_gap_ms: PACKET_GAP_MS,
             show_packets: false,
             scroll_locked: false,
             rx_packets: VecDeque::new(),
@@ -655,61 +675,65 @@ impl App {
         self.tx_packet_dropped += retain_packet(
             &mut self.tx_packets,
             &mut self.tx_packet_bytes,
-            Packet { at, bytes },
+            Packet::new(at, bytes),
+            None,
         );
+        self.dirty = true;
+    }
+
+    fn on_received(&mut self, at: u64, bytes: Vec<u8>) {
+        self.last_rx_at = at;
+        self.record_session(at, "RX", &bytes);
+        if let Some(log) = &mut self.log {
+            log.write(&bytes);
+            if self.last_flush.elapsed().as_millis() >= 500 {
+                log.flush();
+                self.last_flush = std::time::Instant::now();
+            }
+        }
+        self.raw.extend(bytes.iter().copied());
+        self.raw_total += bytes.len() as u64;
+        self.rx_bytes += bytes.len() as u64;
+        while self.raw.len() > RAW_CAP {
+            self.raw.pop_front();
+        }
+        self.assembler.feed(&bytes);
+        let rows: Vec<Row> = self
+            .assembler
+            .take()
+            .into_iter()
+            .map(|mut cells| {
+                if let Some(color) = crate::esp::log::color(&cells) {
+                    for cell in &mut cells {
+                        if cell.style.fg.is_none() {
+                            cell.style.fg = Some(color);
+                        }
+                    }
+                }
+                Row { cells, at }
+            })
+            .collect();
+        self.check_triggers(&rows);
+        for row in rows {
+            if self.levels[level_of(&row.cells)] {
+                self.scrollback.push(row);
+            }
+        }
+        self.scan_esp(&bytes);
+        self.rx_packet_dropped += retain_packet(
+            &mut self.rx_packets,
+            &mut self.rx_packet_bytes,
+            Packet::new(at, bytes),
+            Some(self.packet_gap_ms),
+        );
+        self.version += 1;
         self.dirty = true;
     }
 
     pub fn on_event(&mut self, event: Event) {
         match event {
-            Event::Data(bytes) => {
-                let at = now_ms();
-                self.last_rx_at = at;
-                self.record_session(at, "RX", &bytes);
-                if let Some(log) = &mut self.log {
-                    log.write(&bytes);
-                    if self.last_flush.elapsed().as_millis() >= 500 {
-                        log.flush();
-                        self.last_flush = std::time::Instant::now();
-                    }
-                }
-                self.raw.extend(bytes.iter().copied());
-                self.raw_total += bytes.len() as u64;
-                self.rx_bytes += bytes.len() as u64;
-                while self.raw.len() > RAW_CAP {
-                    self.raw.pop_front();
-                }
-                self.assembler.feed(&bytes);
-                let rows: Vec<Row> = self
-                    .assembler
-                    .take()
-                    .into_iter()
-                    .map(|mut cells| {
-                        if let Some(color) = crate::esp::log::color(&cells) {
-                            for cell in &mut cells {
-                                if cell.style.fg.is_none() {
-                                    cell.style.fg = Some(color);
-                                }
-                            }
-                        }
-                        Row { cells, at }
-                    })
-                    .collect();
-                self.check_triggers(&rows);
-                for row in rows {
-                    if self.levels[level_of(&row.cells)] {
-                        self.scrollback.push(row);
-                    }
-                }
-                self.scan_esp(&bytes);
-                self.rx_packet_dropped += retain_packet(
-                    &mut self.rx_packets,
-                    &mut self.rx_packet_bytes,
-                    Packet { at, bytes },
-                );
-                self.version += 1;
-                self.dirty = true;
-            }
+            Event::Data(bytes) => self.on_received(now_ms(), bytes),
+            Event::Received { at, bytes } => self.on_received(at, bytes),
             Event::Written(bytes) => {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
                 self.record_tx(bytes);
@@ -1946,6 +1970,26 @@ impl App {
                 }
                 return;
             }
+            gap if gap.starts_with("packets gap") => {
+                match gap["packets gap".len()..].trim().parse::<u64>() {
+                    Ok(ms) if ms <= 60_000 => {
+                        self.packet_gap_ms = ms;
+                        self.status = if ms == 0 {
+                            "packet framing: one packet per read".to_string()
+                        } else {
+                            format!("packet framing: idle gap {ms} ms (applies to new data)")
+                        };
+                    }
+                    _ => {
+                        self.status = format!(
+                            "usage: /packets gap <0-60000 ms> (current {} ms, 0 = per read)",
+                            self.packet_gap_ms
+                        );
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
             "packets" | "packets on" | "packets off" => {
                 if rest == "packets" || self.show_packets != rest.ends_with("on") {
                     self.toggle_packets();
@@ -2336,9 +2380,30 @@ fn raw_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     })
 }
 
-fn retain_packet(packets: &mut VecDeque<Packet>, size: &mut usize, packet: Packet) -> usize {
+/// Appends `packet`, or merges it into the previous one when it arrived within
+/// `gap_ms` of that packet's last chunk (idle-gap framing). Returns how many old
+/// packets were evicted to stay within the caps.
+fn retain_packet(
+    packets: &mut VecDeque<Packet>,
+    size: &mut usize,
+    packet: Packet,
+    gap_ms: Option<u64>,
+) -> usize {
     *size += packet.bytes.len();
-    packets.push_back(packet);
+    let merge_into = gap_ms.filter(|gap| *gap > 0).and_then(|gap| {
+        packets.back_mut().filter(|last| {
+            packet.at >= last.last
+                && packet.at - last.last <= gap
+                && last.bytes.len() + packet.bytes.len() <= PACKET_MAX_BYTES
+        })
+    });
+    match merge_into {
+        Some(last) => {
+            last.last = packet.at;
+            last.bytes.extend_from_slice(&packet.bytes);
+        }
+        None => packets.push_back(packet),
+    }
     let mut removed = 0;
     while packets.len() > PACKET_CAP || *size > RAW_CAP {
         if let Some(old) = packets.pop_front() {
