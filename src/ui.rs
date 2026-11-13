@@ -823,16 +823,15 @@ fn draw_hex(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         let start = row * per_row;
         let end = (start + per_row).min(len);
         let mut text = format!("{:08x} ", base + start as u64);
-        for i in start..start + per_row {
-            if i < end {
-                text.push_str(&format!("{:02x} ", app.raw[i]));
-            } else {
-                text.push_str("   ");
-            }
+        for byte in app.raw.range(start..end) {
+            text.push_str(&format!("{byte:02x} "));
+        }
+        // 末行不足 per_row 时补空格，保持 ASCII 列对齐
+        for _ in end - start..per_row {
+            text.push_str("   ");
         }
         text.push('|');
-        for i in start..end {
-            let byte = app.raw[i];
+        for &byte in app.raw.range(start..end) {
             text.push(if (0x20..0x7f).contains(&byte) {
                 char::from(byte)
             } else {

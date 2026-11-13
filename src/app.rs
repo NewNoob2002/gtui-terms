@@ -2719,7 +2719,10 @@ mod tests {
     #[test]
     fn panic_with_mismatched_elf_is_flagged() {
         let mut app = app();
-        app.set_elf(std::path::PathBuf::from("target/debug/gtui-terms.exe"));
+        // 用测试进程自身作为可加载的目标文件：硬编码 target/debug/gtui-terms.exe
+        // 在 Linux 上不存在，且 clippy/test 之前也未必构建过该文件。
+        let exe = std::env::current_exe().unwrap();
+        assert!(app.set_elf(exe), "{}", app.status);
         app.on_event(Event::Data(
             b"Guru Meditation Error: Core 0 panic'ed\r\nCore  0 register dump:\r\n\
               PC      : 0x400d1f2a  PS      : 0x00060d30\r\n\

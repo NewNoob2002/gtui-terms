@@ -485,7 +485,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let images = Images::new();
         let image = images.image("unreadable.bin", &[1]);
-        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o000)).unwrap();
         // Privileged users can read mode-000 files; exercise this only when access is denied.
         if File::open(&image).is_err() {
             assert!(
