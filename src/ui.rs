@@ -69,6 +69,12 @@ fn draw_toolbar(frame: &mut Frame, app: &mut App) -> u16 {
         } else {
             "Packets:off"
         },
+        if app.show_timestamps {
+            "Time:on ^T"
+        } else {
+            "Time:off ^T"
+        },
+        "Clear ^L",
     ];
     let mut start = 0;
     if app.focus == Focus::Toolbar {
@@ -543,6 +549,19 @@ fn preserve_scroll(
     }
 }
 
+/// Dim style for timestamp prefixes: a separate column that never takes the data's colour.
+const TIME_STYLE: Style = Style::new().fg(Color::DarkGray);
+/// Escaped line-ending markers in packet view, shown but de-emphasised.
+const ESCAPE_STYLE: Style = Style::new().fg(Color::DarkGray);
+
+fn time_prefix(cells: &mut Vec<(char, Style)>, at: u64) {
+    cells.extend(format_time(at).chars().map(|ch| (ch, TIME_STYLE)));
+    cells.push((' ', PLAIN));
+}
+
+/// Renders one packet: a `RX 32B` header, then its content broken after every
+/// `\n` so text protocols stay readable. Continuation rows are indented under
+/// the content, and each line is coloured by its ESP-IDF log level.
 fn packet_rows(
     out: &mut Vec<Line<'static>>,
     packet: &crate::app::Packet,
@@ -552,23 +571,52 @@ fn packet_rows(
     packets: bool,
     view: View,
 ) {
-    let mut text = String::new();
+    let limit = usize::from(width.max(1));
+    let mut header: Vec<(char, Style)> = Vec::new();
     if timestamps {
-        text.push_str(&format_time(packet.at));
-        text.push(' ');
+        time_prefix(&mut header, packet.at);
     }
     if packets {
-        text.push_str(&format!("{direction} {}B ", packet.bytes.len()));
+        let style = Style::new().fg(if direction == "TX" {
+            Color::Magenta
+        } else {
+            Color::Cyan
+        });
+        header.extend(
+            format!("{direction} {}B ", packet.bytes.len())
+                .chars()
+                .map(|ch| (ch, style)),
+        );
     }
+    let indent = header
+        .iter()
+        .map(|&(ch, _)| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum::<usize>();
+    // 缩进过宽时（窄窗口）放弃缩进，避免续行没有可用宽度。
+    let indent = if indent * 2 > limit { 0 } else { indent };
+    let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
     if view == View::Hex {
-        use std::fmt::Write;
+        let mut line = Vec::new();
         for (index, byte) in packet.bytes.iter().enumerate() {
             if index > 0 {
-                text.push(' ');
+                line.push((' ', PLAIN));
             }
-            let _ = write!(text, "{byte:02x}");
+            line.extend(format!("{byte:02x}").chars().map(|ch| (ch, PLAIN)));
         }
+        lines.push(line);
     } else {
+        let mut line: Vec<(char, Style)> = Vec::new();
+        let finish = |line: &mut Vec<(char, Style)>, lines: &mut Vec<Vec<(char, Style)>>| {
+            let cells: Vec<Cell> = line.iter().map(|&(ch, style)| Cell { ch, style }).collect();
+            if let Some(color) = crate::esp::log::color(&cells) {
+                for cell in line.iter_mut() {
+                    if cell.1 == PLAIN {
+                        cell.1 = Style::new().fg(color);
+                    }
+                }
+            }
+            lines.push(std::mem::take(line));
+        };
         let mut remaining = packet.bytes.as_slice();
         while !remaining.is_empty() {
             let (valid, consumed) = match std::str::from_utf8(remaining) {
@@ -579,25 +627,57 @@ fn packet_rows(
                 ),
             };
             for ch in valid.chars() {
-                match ch {
-                    '\r' => text.push_str("\\r"),
-                    '\n' => text.push_str("\\n"),
-                    '\t' => text.push_str("\\t"),
-                    '\\' => text.push_str("\\\\"),
-                    ch if ch.is_control() => text.extend(ch.escape_default()),
-                    ch => text.push(ch),
+                let escaped = match ch {
+                    '\r' => "\\r".to_string(),
+                    '\n' => "\\n".to_string(),
+                    '\t' => "\\t".to_string(),
+                    '\\' => "\\\\".to_string(),
+                    ch if ch.is_control() => ch.escape_default().to_string(),
+                    ch => {
+                        line.push((ch, PLAIN));
+                        continue;
+                    }
+                };
+                line.extend(escaped.chars().map(|ch| (ch, ESCAPE_STYLE)));
+                if ch == '\n' {
+                    finish(&mut line, &mut lines);
                 }
             }
             remaining = &remaining[consumed..];
             if let Some((&byte, rest)) = remaining.split_first() {
-                use std::fmt::Write;
-                let _ = write!(text, "\\x{byte:02X}");
+                line.extend(
+                    format!("\\x{byte:02X}")
+                        .chars()
+                        .map(|ch| (ch, ESCAPE_STYLE)),
+                );
                 remaining = rest;
             }
         }
+        if !line.is_empty() || lines.is_empty() {
+            finish(&mut line, &mut lines);
+        }
     }
-    let cells: Vec<_> = text.chars().map(|ch| (ch, PLAIN)).collect();
-    push_wrapped(out, &cells, usize::from(width.max(1)));
+    for (index, line) in lines.into_iter().enumerate() {
+        let mut cells = if index == 0 {
+            header.clone()
+        } else {
+            vec![(' ', PLAIN); indent]
+        };
+        let body = limit.saturating_sub(indent).max(1);
+        // 内容按剩余宽度折行，每个折行都对齐到内容列。
+        let mut used = 0;
+        for (ch, style) in line {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > body && used > 0 {
+                out.push(to_line(&cells));
+                cells = vec![(' ', PLAIN); indent];
+                used = 0;
+            }
+            cells.push((ch, style));
+            used += w;
+        }
+        out.push(to_line(&cells));
+    }
 }
 
 fn key_label(entry: &crate::config::Macro) -> String {
@@ -678,6 +758,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         "/escapes [on|off] parses \\r \\n \\t \\0 \\\\ \\xHH in TEXT sends | /rxcr [newline|overwrite] handles lone CR.",
         "/dtr on|off, /rts on|off set modem lines | /counters reset zeroes RX/TX byte totals.",
         "//help sends literal /help; a single leading slash runs a local command.",
+        "/clear (Ctrl+L, toolbar Clear) empties the screen; capture and /save keep everything.",
         "/help opens this help | /settings opens serial settings | /ports opens ports.",
         "/esp opens ESP-IDF tools | /elf build/app.elf loads matching debug symbols.",
         "/reset resets | /boot or /bootloader enters the ROM bootloader.",
@@ -1054,10 +1135,7 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
         starts.push(out.len());
         cells.clear();
         if app.show_timestamps {
-            for ch in format_time(row.at).chars() {
-                cells.push((ch, PLAIN));
-            }
-            cells.push((' ', PLAIN));
+            time_prefix(&mut cells, row.at);
         }
         if needle.is_empty() && app.search_re.is_none() {
             cells.extend(row.cells.iter().map(|c| (c.ch, c.style)));
@@ -1083,8 +1161,7 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
     if !pending.is_empty() {
         cells.clear();
         if app.show_timestamps {
-            cells.extend(format_time(app.last_rx_at).chars().map(|ch| (ch, PLAIN)));
-            cells.push((' ', PLAIN));
+            time_prefix(&mut cells, app.last_rx_at);
         }
         let fallback = crate::esp::log::color(pending);
         cells.extend(pending.iter().map(|c: &Cell| {
@@ -1305,6 +1382,80 @@ mod tests {
             app.execute("/lock off");
             assert!(pane(&mut app, false).contains("row-22"));
         }
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn color_at(line: &Line, needle: &str) -> Option<Color> {
+        let mut text = String::new();
+        for span in &line.spans {
+            text.push_str(&span.content);
+            if text.contains(needle) {
+                return span.style.fg;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn packet_rows_break_lines_and_keep_log_colors_with_timestamps() {
+        let mut app = app();
+        app.execute("/packets on");
+        app.on_event(Event::Received {
+            at: 1_000,
+            bytes: b"I (1) a: one\r\nE (2) b: two\r\n".to_vec(),
+        });
+        for timestamps in [false, true] {
+            app.show_timestamps = timestamps;
+            let (rows, starts, _) = build_rows(&app, 80);
+            assert_eq!(starts, [0]);
+            assert_eq!(
+                rows.len(),
+                2,
+                "{:?}",
+                rows.iter().map(line_text).collect::<Vec<_>>()
+            );
+            let first = line_text(&rows[0]);
+            let second = line_text(&rows[1]);
+            assert!(first.contains("RX 28B I (1) a: one\\r\\n"), "{first}");
+            assert!(second.trim_start().starts_with("E (2) b: two"), "{second}");
+            // 续行与首行内容对齐
+            assert_eq!(second.find('E'), first.find("I ("), "{first}\n{second}");
+            assert_eq!(color_at(&rows[0], "I (1"), Some(Color::Green));
+            assert_eq!(color_at(&rows[1], "E (2"), Some(Color::Red));
+        }
+        app.show_timestamps = false;
+        app.execute("/packets off");
+        app.show_timestamps = true;
+        let (rows, _, _) = build_rows(&app, 80);
+        assert_eq!(color_at(&rows[0], "I (1"), Some(Color::Green));
+    }
+
+    #[test]
+    fn toolbar_toggles_time_and_clears_screen() {
+        let mut app = app();
+        app.on_event(Event::Data(b"hello\r\n".to_vec()));
+        let text = rendered(&mut app, 160, 10);
+        assert!(
+            text.contains("Time:off ^T") && text.contains("Clear ^L"),
+            "{text}"
+        );
+        app.focus = Focus::Toolbar;
+        app.toolbar_selected = 9;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.show_timestamps);
+        assert!(!app.show_packets, "timestamps are independent of packets");
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.scrollback.len(), 0);
+        app.on_event(Event::Data(b"again\r\n".to_vec()));
+        app.execute("/clear");
+        assert!(!rendered(&mut app, 160, 10).contains("again"));
     }
 
     #[test]

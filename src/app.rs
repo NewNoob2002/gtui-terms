@@ -29,6 +29,8 @@ pub const RAW_CAP: usize = 1024 * 1024;
 const PACKET_CAP: usize = 2000;
 /// Default idle gap that closes an RX packet; reads closer than this are one frame.
 pub const PACKET_GAP_MS: u64 = 20;
+/// Toolbar buttons drawn by `ui::draw_toolbar`, in `toolbar_action` order.
+pub const TOOLBAR_ITEMS: usize = 11;
 /// Upper bound for one merged RX packet so a continuous stream still splits.
 const PACKET_MAX_BYTES: usize = 4096;
 
@@ -885,6 +887,8 @@ impl App {
             6 => self.open_popup(Popup::Save),
             7 => self.toggle_lock(),
             8 => self.toggle_packets(),
+            9 => self.toggle_timestamps(),
+            10 => self.clear(),
             _ => {}
         }
         self.dirty = true;
@@ -1463,10 +1467,11 @@ impl App {
         if self.focus == Focus::Toolbar {
             match key.code {
                 KeyCode::Left | KeyCode::Up => {
-                    self.toolbar_selected = (self.toolbar_selected + 8) % 9
+                    self.toolbar_selected =
+                        (self.toolbar_selected + TOOLBAR_ITEMS - 1) % TOOLBAR_ITEMS
                 }
                 KeyCode::Right | KeyCode::Down => {
-                    self.toolbar_selected = (self.toolbar_selected + 1) % 9
+                    self.toolbar_selected = (self.toolbar_selected + 1) % TOOLBAR_ITEMS
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.toolbar_action(self.toolbar_selected),
                 KeyCode::Esc => self.focus = Focus::Output,
@@ -2196,6 +2201,10 @@ impl App {
             return;
         }
         match rest {
+            "clear" | "cls" => {
+                self.clear();
+                return;
+            }
             "help" => {
                 self.help = true;
                 self.help_scroll = 0;
