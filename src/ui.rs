@@ -14,27 +14,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits_ui.clear();
     let area = frame.area();
     let header = draw_toolbar(frame, app);
-    let remaining = area.height.saturating_sub(header);
-    let show_hint = area.height >= 6;
     let body = Rect::new(
         area.x,
         area.y + header,
         area.width,
-        remaining.saturating_sub(u16::from(show_hint)),
+        area.height.saturating_sub(header),
     );
     match app.mode {
         Mode::Picker => draw_picker(frame, app, body),
         Mode::Terminal => draw_terminal(frame, app, body),
-    }
-    if show_hint && remaining > 0 {
-        let hint = format!(
-            " Tab: toolbar/output/input | focus {:?} | click input to send | F1 /help | Ctrl+Q quit",
-            app.focus
-        );
-        frame.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(Color::Cyan)),
-            Rect::new(area.x, area.bottom() - 1, area.width, 1),
-        );
     }
     if app.help {
         draw_help(frame, app);
@@ -46,55 +34,87 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_toolbar(frame: &mut Frame, app: &mut App) -> u16 {
-    let area = frame.area();
+/// 顶部菜单栏使用的按钮下标（其余按钮在输入框上方的快捷栏）。
+const MENU_BUTTONS: std::ops::Range<usize> = 0..6;
+/// 输入框上方快捷栏的按钮下标。
+const QUICK_BUTTONS: std::ops::Range<usize> = 6..crate::app::TOOLBAR_ITEMS;
+
+/// 按钮的完整标签和窄屏时使用的短标签。
+fn button_label(app: &App, index: usize) -> (String, String) {
+    let on = |flag: bool| if flag { "on" } else { "off" };
+    let (full, short) = match index {
+        0 => ("Ports ^O".to_string(), "Ports".to_string()),
+        1 => ("Settings F3".to_string(), "Set".to_string()),
+        2 => ("Actions F4".to_string(), "Act".to_string()),
+        3 => ("ESP".to_string(), "ESP".to_string()),
+        4 => ("Help F1".to_string(), "Help".to_string()),
+        5 => ("Quit ^Q".to_string(), "Quit".to_string()),
+        6 => ("Save ^S".to_string(), "Save".to_string()),
+        7 => (
+            format!("Lock:{} ^B", on(app.scroll_locked)),
+            format!("Lock:{}", on(app.scroll_locked)),
+        ),
+        8 => (
+            format!("Packets:{}", on(app.show_packets)),
+            format!("Pkt:{}", on(app.show_packets)),
+        ),
+        9 => (
+            format!("Time:{} ^T", on(app.show_timestamps)),
+            format!("Time:{}", on(app.show_timestamps)),
+        ),
+        10 => ("Clear ^L".to_string(), "Clear".to_string()),
+        11 => (
+            format!("Mouse:{}", if app.mouse_capture { "app" } else { "term" }),
+            format!("M:{}", if app.mouse_capture { "app" } else { "term" }),
+        ),
+        _ => (
+            format!("TX:{}", if app.tx_inline { "inline" } else { "pane" }),
+            format!("TX:{}", if app.tx_inline { "in" } else { "pane" }),
+        ),
+    };
+    (full, short)
+}
+
+/// 在一行内绘制一组按钮：放不下时改用短标签，仍放不下时滚动到选中按钮。
+fn draw_buttons(frame: &mut Frame, app: &mut App, area: Rect, buttons: std::ops::Range<usize>) {
     if area.width == 0 || area.height == 0 {
-        return 0;
+        return;
     }
-    let labels = [
-        "Ports ^O",
-        "Settings F3",
-        "Actions F4",
-        "ESP",
-        "Help F1",
-        "Quit ^Q",
-        "Save ^S",
-        if app.scroll_locked {
-            "Lock:on ^B"
-        } else {
-            "Lock:off ^B"
-        },
-        if app.show_packets {
-            "Packets:on"
-        } else {
-            "Packets:off"
-        },
-        if app.show_timestamps {
-            "Time:on ^T"
-        } else {
-            "Time:off ^T"
-        },
-        "Clear ^L",
-    ];
+    let labels: Vec<(String, String)> = buttons.clone().map(|i| button_label(app, i)).collect();
+    let fits = |pick: &dyn Fn(&(String, String)) -> usize| {
+        labels.iter().map(|label| pick(label) + 3).sum::<usize>() <= usize::from(area.width) + 1
+    };
+    // 三级降级：完整标签 → 短标签 → 去掉按钮内边距的短标签。
+    let short = !fits(&|label| label.0.chars().count());
+    let compact = short && !fits(&|label| label.1.chars().count());
+    let texts: Vec<String> = labels
+        .into_iter()
+        .map(|(full, brief)| match (short, compact) {
+            (false, _) => format!(" {full} "),
+            (true, false) => format!(" {brief} "),
+            (true, true) => brief,
+        })
+        .collect();
     let mut start = 0;
-    if app.focus == Focus::Toolbar {
-        while start < app.toolbar_selected
-            && labels[start..=app.toolbar_selected]
+    if app.focus == Focus::Toolbar && buttons.contains(&app.toolbar_selected) {
+        let selected = app.toolbar_selected - buttons.start;
+        while start < selected
+            && texts[start..=selected]
                 .iter()
-                .map(|label| label.len() + 3)
+                .map(|text| text.chars().count() + 1)
                 .sum::<usize>()
-                > usize::from(area.width)
+                > usize::from(area.width) + 1
         {
             start += 1;
         }
     }
     let mut x = area.x;
-    for (index, label) in labels.iter().enumerate().skip(start) {
+    for (offset, text) in texts.iter().enumerate().skip(start) {
         if x >= area.right() {
             break;
         }
-        let text = format!(" {label} ");
-        let width = (text.len() as u16).min(area.right() - x);
+        let index = buttons.start + offset;
+        let width = (text.chars().count() as u16).min(area.right() - x);
         let rect = Rect::new(x, area.y, width, 1);
         let style = if app.focus == Focus::Toolbar && app.toolbar_selected == index {
             Style::default()
@@ -104,9 +124,34 @@ fn draw_toolbar(frame: &mut Frame, app: &mut App) -> u16 {
         } else {
             Style::default().bg(Color::DarkGray).fg(Color::White)
         };
-        frame.render_widget(Paragraph::new(text).style(style), rect);
+        frame.render_widget(Paragraph::new(text.as_str()).style(style), rect);
         app.hits_ui.push((rect, Hit::Toolbar(index)));
         x = x.saturating_add(width).saturating_add(1);
+    }
+}
+
+fn draw_toolbar(frame: &mut Frame, app: &mut App) -> u16 {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+    let row = Rect::new(area.x, area.y, area.width, 1);
+    draw_buttons(frame, app, row, MENU_BUTTONS);
+    // 右侧显示当前焦点，替代原来底部的提示行。
+    let focus = format!(" {:?} · Tab ", app.focus);
+    let used: u16 = app
+        .hits_ui
+        .iter()
+        .filter(|(_, hit)| matches!(hit, Hit::Toolbar(_)))
+        .map(|(rect, _)| rect.right())
+        .max()
+        .unwrap_or(area.x);
+    let width = focus.chars().count() as u16;
+    if used + 1 + width <= area.right() {
+        frame.render_widget(
+            Paragraph::new(focus).style(Style::default().fg(Color::Cyan)),
+            Rect::new(area.right() - width, area.y, width, 1),
+        );
     }
     1
 }
@@ -198,13 +243,15 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(u16::from(area.height >= 4)),
+        Constraint::Length(u16::from(area.height >= 6)),
         Constraint::Length(input_height(app, area)),
     ])
     .split(area);
 
     app.view_height = chunks[0].height.max(1);
-    app.hits_ui.push((chunks[2], Hit::Input));
+    app.hits_ui.push((chunks[3], Hit::Input));
     draw_streams(frame, app, chunks[0]);
+    draw_buttons(frame, app, chunks[2], QUICK_BUTTONS);
 
     let mut status = format!(
         " {} | {} | {} | {} lines",
@@ -276,7 +323,7 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
         chunks[1],
     );
 
-    draw_input(frame, app, chunks[2]);
+    draw_input(frame, app, chunks[3]);
 }
 
 fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -432,7 +479,7 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_streams(frame: &mut Frame, app: &mut App, area: Rect) {
-    let split = area.width >= 72 || !app.tx_packets.is_empty();
+    let split = !app.tx_inline;
     let panes = Layout::horizontal([
         Constraint::Percentage(if split { 65 } else { 100 }),
         Constraint::Min(0),
@@ -440,29 +487,44 @@ fn draw_streams(frame: &mut Frame, app: &mut App, area: Rect) {
     .split(area);
     let mut rx_block = Block::new();
     if area.height >= 3 {
-        rx_block = rx_block.borders(Borders::TOP).title(if app.show_packets {
-            " RX — read chunks "
-        } else {
-            " RX — received "
-        });
+        rx_block = rx_block
+            .borders(Borders::TOP)
+            .title(match (app.show_packets, app.tx_inline) {
+                (true, true) => " RX/TX — packets ",
+                (true, false) => " RX — packets ",
+                (false, true) => " RX/TX ",
+                (false, false) => " RX — received ",
+            })
+            .title(
+                Line::from(Span::styled(
+                    " drag to copy ",
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .right_aligned(),
+            );
     }
     let rx_area = rx_block.inner(panes[0]);
     frame.render_widget(rx_block, panes[0]);
     app.view_height = rx_area.height.max(1);
+    app.rx_area = rx_area;
     app.hits_ui.push((rx_area, Hit::Output));
-    match app.view {
-        View::Hex if !app.show_packets => draw_hex(frame, app, rx_area),
+    let top = match app.view {
+        View::Hex if !app.show_packets => {
+            draw_hex(frame, app, rx_area);
+            None
+        }
         _ => {
             cached_rows(app, rx_area.width.max(1));
             let max_top = app.cache.len().saturating_sub(usize::from(app.view_height));
             let top = max_top.saturating_sub(app.scroll_back.min(max_top));
-            frame.render_widget(
-                Paragraph::new(app.cache.as_slice())
-                    .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0)),
-                rx_area,
-            );
+            let end = top
+                .saturating_add(usize::from(rx_area.height))
+                .min(app.cache.len());
+            frame.render_widget(Paragraph::new(&app.cache[top..end]), rx_area);
+            Some(top)
         }
-    }
+    };
+    draw_selection(frame, app, rx_area, top);
     if !split {
         return;
     }
@@ -489,12 +551,15 @@ fn draw_streams(frame: &mut Frame, app: &mut App, area: Rect) {
             starts.push(rows.len());
             packet_rows(
                 &mut rows,
+                &mut Vec::new(),
                 packet,
                 "TX",
-                tx_area.width,
-                app.show_timestamps,
-                app.show_packets,
-                app.view,
+                PacketLayout {
+                    width: tx_area.width,
+                    timestamps: app.show_timestamps,
+                    packets: app.show_packets,
+                    view: app.view,
+                },
             );
         }
         let removed = app.tx_packet_dropped.saturating_sub(app.tx_cache.dropped);
@@ -562,15 +627,28 @@ fn time_prefix(cells: &mut Vec<(char, Style)>, at: u64) {
 /// Renders one packet: a `RX 32B` header, then its content broken after every
 /// `\n` so text protocols stay readable. Continuation rows are indented under
 /// the content, and each line is coloured by its ESP-IDF log level.
-fn packet_rows(
-    out: &mut Vec<Line<'static>>,
-    packet: &crate::app::Packet,
-    direction: &str,
+/// Display options shared by every packet rendered in one pass.
+#[derive(Clone, Copy)]
+struct PacketLayout {
     width: u16,
     timestamps: bool,
     packets: bool,
     view: View,
+}
+
+fn packet_rows(
+    out: &mut Vec<Line<'static>>,
+    cont: &mut Vec<bool>,
+    packet: &crate::app::Packet,
+    direction: &str,
+    layout: PacketLayout,
 ) {
+    let PacketLayout {
+        width,
+        timestamps,
+        packets,
+        view,
+    } = layout;
     let limit = usize::from(width.max(1));
     let mut header: Vec<(char, Style)> = Vec::new();
     if timestamps {
@@ -658,6 +736,7 @@ fn packet_rows(
         }
     }
     for (index, line) in lines.into_iter().enumerate() {
+        let first = out.len();
         let mut cells = if index == 0 {
             header.clone()
         } else {
@@ -669,6 +748,7 @@ fn packet_rows(
         for (ch, style) in line {
             let w = UnicodeWidthChar::width(ch).unwrap_or(0);
             if used + w > body && used > 0 {
+                cont.push(out.len() > first);
                 out.push(to_line(&cells));
                 cells = vec![(' ', PLAIN); indent];
                 used = 0;
@@ -676,6 +756,7 @@ fn packet_rows(
             cells.push((ch, style));
             used += w;
         }
+        cont.push(out.len() > first);
         out.push(to_line(&cells));
     }
 }
@@ -720,7 +801,12 @@ fn wrapped_text(text: impl IntoIterator<Item = String>, width: u16) -> Vec<Line<
     let mut lines = Vec::new();
     for text in text {
         let cells: Vec<_> = text.chars().map(|ch| (ch, PLAIN)).collect();
-        push_wrapped(&mut lines, &cells, usize::from(width.max(1)));
+        push_wrapped(
+            &mut lines,
+            &mut Vec::new(),
+            &cells,
+            usize::from(width.max(1)),
+        );
     }
     lines
 }
@@ -769,7 +855,8 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         "/confirm executes the pending destructive operation; /cancel discards it.",
         "/save [path] exports the full session; existing files are never overwritten. Records contain UTC time, RX/TX/TOOL, exact HEX and escaped text.",
         "/lock on|off freezes/resumes viewport | /timestamps on|off | /packets on|off | /packets gap <ms>.",
-        "RX is left, confirmed TX is right. Packets are serial read/write chunks, not protocol frames. Mouse wheel scrolls each pane.",
+        "Confirmed TX is shown inline with RX by write time; /txview split|inline toggles a separate TX pane. Packets are serial read/write chunks, not protocol frames.",
+        "Drag in the RX/TX pane to copy (OSC 52 clipboard); any key clears the selection. /mouse off|on hands the mouse to the terminal. Mouse wheel scrolls each pane.",
         "/eol crlf|lf|cr|none changes the line ending; example: /eol lf.",
         "/hex 01 0d 0a sends exact bytes without adding EOL (also accepts 0x41,42).",
         "/filter i,w,e selects ESP log levels for new rows; /filter all restores all.",
@@ -1070,7 +1157,7 @@ fn draw_hex(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 
 fn cached_rows(app: &mut App, width: u16) -> &[Line<'static>] {
     if app.cache_width != width || app.cache_version != app.version {
-        let (rows, starts, total) = build_rows(app, width);
+        let (rows, starts, total, cont) = build_rows(app, width);
         let dropped = if app.show_packets {
             app.rx_packet_dropped
         } else {
@@ -1088,10 +1175,11 @@ fn cached_rows(app: &mut App, width: u16) -> &[Line<'static>] {
             rows.len(),
             usize::from(app.view_height),
             removed_rows,
-            app.scroll_locked,
+            app.scroll_locked || app.selection.is_some(),
         );
         app.cache_dropped = dropped;
         app.cache = rows;
+        app.cache_cont = cont;
         app.starts = starts;
         app.total_rows = total;
         app.cache_width = width;
@@ -1100,25 +1188,53 @@ fn cached_rows(app: &mut App, width: u16) -> &[Line<'static>] {
     &app.cache
 }
 
-fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) {
+/// 构建输出区的行：返回 (行, 每条 RX 记录的首行下标, 行数, 每行是否为折行续行)。
+/// `tx_inline` 时按时间把 TX 记录插入 RX 之间，TX 不计入 `starts`。
+type Rows = (Vec<Line<'static>>, Vec<usize>, usize, Vec<bool>);
+
+fn build_rows(app: &App, width: u16) -> Rows {
     let limit = usize::from(width.max(1));
     let mut out = Vec::with_capacity(app.scrollback.len() + 1);
+    let mut cont = Vec::with_capacity(app.scrollback.len() + 1);
     let mut starts = Vec::with_capacity(app.scrollback.len());
+    let mut tx = app.tx_packets.iter().filter(|_| app.tx_inline).peekable();
+    // 把时间早于 `before` 的 TX 记录插入当前位置。
+    let mut flush_tx = |out: &mut Vec<Line<'static>>, cont: &mut Vec<bool>, before: Option<u64>| {
+        while let Some(packet) = tx.next_if(|p| before.is_none_or(|at| p.at < at)) {
+            packet_rows(
+                out,
+                cont,
+                packet,
+                "TX",
+                PacketLayout {
+                    width,
+                    timestamps: app.show_timestamps,
+                    packets: true,
+                    view: app.view,
+                },
+            );
+        }
+    };
     if app.show_packets {
         for packet in &app.rx_packets {
+            flush_tx(&mut out, &mut cont, Some(packet.at));
             starts.push(out.len());
             packet_rows(
                 &mut out,
+                &mut cont,
                 packet,
                 "RX",
-                width,
-                app.show_timestamps,
-                true,
-                app.view,
+                PacketLayout {
+                    width,
+                    timestamps: app.show_timestamps,
+                    packets: true,
+                    view: app.view,
+                },
             );
         }
+        flush_tx(&mut out, &mut cont, None);
         let total = out.len();
-        return (out, starts, total);
+        return (out, starts, total, cont);
     }
     let needle: Vec<char> = app
         .search_query
@@ -1132,6 +1248,7 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
         .unwrap_or_default();
     let mut cells: Vec<(char, Style)> = Vec::new();
     for row in app.scrollback.iter() {
+        flush_tx(&mut out, &mut cont, Some(row.at));
         starts.push(out.len());
         cells.clear();
         if app.show_timestamps {
@@ -1155,10 +1272,11 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
                 )
             }));
         }
-        push_wrapped(&mut out, &cells, limit);
+        push_wrapped(&mut out, &mut cont, &cells, limit);
     }
     let pending = app.assembler.pending();
     if !pending.is_empty() {
+        flush_tx(&mut out, &mut cont, Some(app.last_rx_at));
         cells.clear();
         if app.show_timestamps {
             time_prefix(&mut cells, app.last_rx_at);
@@ -1171,10 +1289,70 @@ fn build_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>, usize) 
             }
             (c.ch, style)
         }));
-        push_wrapped(&mut out, &cells, limit);
+        push_wrapped(&mut out, &mut cont, &cells, limit);
     }
+    flush_tx(&mut out, &mut cont, None);
     let total = out.len();
-    (out, starts, total)
+    (out, starts, total, cont)
+}
+
+/// 绘制拖选高亮；松开鼠标后从屏幕缓冲区取出选区文本交给剪贴板。
+/// `top` 为文本视图首行在 `app.cache` 中的下标（十六进制视图为 `None`，按屏幕行复制）。
+fn draw_selection(frame: &mut Frame, app: &mut App, area: Rect, top: Option<usize>) {
+    let Some(selection) = app.selection else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let clamp = |(x, y): (u16, u16)| {
+        (
+            x.clamp(area.x, area.right() - 1),
+            y.clamp(area.y, area.bottom() - 1),
+        )
+    };
+    let (a, b) = (clamp(selection.anchor), clamp(selection.head));
+    let ((sx, sy), (ex, ey)) = if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut text = String::new();
+    let buffer = frame.buffer_mut();
+    for y in sy..=ey {
+        let from = if y == sy { sx } else { area.x };
+        let to = if y == ey { ex } else { area.right() - 1 };
+        let mut row = String::new();
+        for x in from..=to {
+            let cell = &mut buffer[(x, y)];
+            row.push_str(cell.symbol());
+            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+        }
+        if y > sy {
+            let wrapped = top
+                .and_then(|top| app.cache_cont.get(top + usize::from(y - area.y)))
+                .copied()
+                .unwrap_or(false);
+            if !wrapped {
+                text.push('\n');
+            }
+        }
+        // 折行续行保留行尾空格，以免拼接时丢失原文的空格。
+        let next_wrapped = y < ey
+            && top
+                .and_then(|top| app.cache_cont.get(top + usize::from(y + 1 - area.y)))
+                .copied()
+                .unwrap_or(false);
+        text.push_str(if next_wrapped { &row } else { row.trim_end() });
+    }
+    if selection.done && !selection.copied {
+        let chars = text.chars().count();
+        app.clipboard = Some(text);
+        app.status = format!("copied {chars} chars to clipboard (OSC 52)");
+        if let Some(selection) = &mut app.selection {
+            selection.copied = true;
+        }
+    }
 }
 
 /// Highlights every cell covered by a regex match on the row text.
@@ -1199,7 +1377,13 @@ fn regex_mask(cells: &[Cell], re: &regex::Regex) -> Vec<bool> {
     mask
 }
 
-fn push_wrapped(out: &mut Vec<Line<'static>>, cells: &[(char, Style)], limit: usize) {
+fn push_wrapped(
+    out: &mut Vec<Line<'static>>,
+    cont: &mut Vec<bool>,
+    cells: &[(char, Style)],
+    limit: usize,
+) {
+    cont.push(false);
     if cells.is_empty() {
         out.push(Line::default());
         return;
@@ -1210,6 +1394,7 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, cells: &[(char, Style)], limit: us
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if used + w > limit && i > start {
             out.push(to_line(&cells[start..i]));
+            cont.push(true);
             start = i;
             used = 0;
         }
@@ -1320,7 +1505,11 @@ mod tests {
     #[test]
     fn narrow_transmit_pane_shows_newest_row_beyond_u16_offset() {
         let mut app = app();
-        app.on_event(Event::Written(b"x".to_vec()));
+        app.tx_inline = false;
+        app.on_event(Event::Sent {
+            at: crate::app::now_ms(),
+            bytes: b"x".to_vec(),
+        });
         let mut terminal = Terminal::new(TestBackend::new(8, 4)).unwrap();
         terminal
             .draw(|frame| {
@@ -1337,7 +1526,10 @@ mod tests {
         let width = usize::from(area.width);
         let mut bytes = vec![b'x'; (usize::from(u16::MAX) + 10) * width];
         bytes.extend(vec![b'Z'; width]);
-        app.on_event(Event::Written(bytes));
+        app.on_event(Event::Sent {
+            at: crate::app::now_ms(),
+            bytes,
+        });
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -1412,7 +1604,7 @@ mod tests {
         });
         for timestamps in [false, true] {
             app.show_timestamps = timestamps;
-            let (rows, starts, _) = build_rows(&app, 80);
+            let (rows, starts, _, _) = build_rows(&app, 80);
             assert_eq!(starts, [0]);
             assert_eq!(
                 rows.len(),
@@ -1432,7 +1624,7 @@ mod tests {
         app.show_timestamps = false;
         app.execute("/packets off");
         app.show_timestamps = true;
-        let (rows, _, _) = build_rows(&app, 80);
+        let (rows, _, _, _) = build_rows(&app, 80);
         assert_eq!(color_at(&rows[0], "I (1"), Some(Color::Green));
     }
 
@@ -1510,16 +1702,26 @@ mod tests {
         }
         let sizes: Vec<_> = app.rx_packets.iter().map(|p| p.bytes.len()).collect();
         assert_eq!(sizes, vec![4096, 1024]);
-        app.on_event(Event::Written(b"one".to_vec()));
-        app.on_event(Event::Written(b"two".to_vec()));
+        app.on_event(Event::Sent {
+            at: crate::app::now_ms(),
+            bytes: b"one".to_vec(),
+        });
+        app.on_event(Event::Sent {
+            at: crate::app::now_ms(),
+            bytes: b"two".to_vec(),
+        });
         assert_eq!(app.tx_packets.len(), 2);
     }
 
     #[test]
     fn transmit_pane_is_independent_and_packet_metadata_toggles() {
         let mut app = app();
+        app.tx_inline = false;
         app.on_event(Event::Data(b"from-rx\n".to_vec()));
-        app.on_event(Event::Written(b"from-tx\r\n".to_vec()));
+        app.on_event(Event::Sent {
+            at: crate::app::now_ms(),
+            bytes: b"from-tx\r\n".to_vec(),
+        });
         let rx = pane(&mut app, false);
         let tx = pane(&mut app, true);
         assert!(rx.contains("from-rx") && !rx.contains("from-tx"));
@@ -1858,5 +2060,137 @@ mod tests {
                 rendered(&mut app, width, height);
             }
         }
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transmit_shares_receive_pane_in_time_order_by_default() {
+        let mut app = app();
+        app.on_event(Event::Received {
+            at: 100,
+            bytes: b"first-rx\n".to_vec(),
+        });
+        app.on_event(Event::Sent {
+            at: crate::app::now_ms(),
+            bytes: b"hello-tx\r\n".to_vec(),
+        });
+        app.on_event(Event::Received {
+            at: u64::MAX / 2,
+            bytes: b"later-rx\n".to_vec(),
+        });
+        let text = pane(&mut app, false);
+        let first = text.find("first-rx").unwrap();
+        let tx = text.find("TX 10B hello-tx").unwrap();
+        let later = text.find("later-rx").unwrap();
+        assert!(first < tx && tx < later, "{text}");
+        assert!(
+            !app.hits_ui
+                .iter()
+                .any(|(_, hit)| matches!(hit, Hit::TxOutput))
+        );
+        // 回复可能先于写完成事件到达 UI；按写入前的时间戳排序，命令仍排在回复之前。
+        let mut app2 = super::tests::app();
+        app2.on_event(Event::Received {
+            at: 1_000,
+            bytes: b"reply\n".to_vec(),
+        });
+        app2.on_event(Event::Sent {
+            at: 500,
+            bytes: b"cmd\r\n".to_vec(),
+        });
+        let text = pane(&mut app2, false);
+        assert!(
+            text.find("cmd").unwrap() < text.find("reply").unwrap(),
+            "{text}"
+        );
+        app.execute("/txview split");
+        assert!(!pane(&mut app, false).contains("hello-tx"));
+        assert!(pane(&mut app, true).contains("hello-tx"));
+    }
+
+    #[test]
+    fn narrow_layout_keeps_all_quick_buttons_visible() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(88, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        let toolbar = &rows[0];
+        for label in ["Ports", "Set", "Act", "ESP", "Help", "Quit"] {
+            assert!(toolbar.contains(label), "{toolbar}");
+        }
+        let quick = rows.iter().find(|row| row.contains("Save")).unwrap();
+        for label in ["Lock", "Time", "Clear", "M", "TX:"] {
+            assert!(quick.contains(label), "{quick}");
+        }
+        let hits: Vec<usize> = app
+            .hits_ui
+            .iter()
+            .filter_map(|(_, hit)| match hit {
+                Hit::Toolbar(index) => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits, (0..crate::app::TOOLBAR_ITEMS).collect::<Vec<_>>());
+        // 更窄时改用短标签，仍保留全部快捷按钮。
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        let quick = rows.iter().find(|row| row.contains("Save")).unwrap();
+        for label in ["Lock", "Time", "Clear", "M:app", "TX:in"] {
+            assert!(quick.contains(label), "{quick}");
+        }
+    }
+
+    #[test]
+    fn dragging_in_receive_pane_copies_text_and_joins_wrapped_rows() {
+        let mut app = app();
+        app.on_event(Event::Data(b"alpha beta\n0123456789ABCDEFGHIJ\n".to_vec()));
+        let mut terminal = Terminal::new(TestBackend::new(16, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.rx_area;
+        let rows = screen(&terminal);
+        let first = (area.y..area.bottom())
+            .find(|&y| rows[usize::from(y)].contains("alpha"))
+            .unwrap();
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            first,
+        ));
+        app.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + 3,
+            first + 2,
+        ));
+        app.on_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x + 3,
+            first + 2,
+        ));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        // 第二行在 16 列宽下折成两行，复制时应拼回原始行。
+        assert_eq!(
+            app.clipboard.as_deref(),
+            Some("alpha beta\n0123456789ABCDEFGHIJ")
+        );
+        assert!(app.status.starts_with("copied"));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selection.is_none());
     }
 }

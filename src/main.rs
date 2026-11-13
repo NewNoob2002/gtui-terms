@@ -357,6 +357,7 @@ fn install_panic_hook() {
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
+    let mut mouse_capture = true;
     while !app.quit {
         // 一次取完已到达的终端事件再重绘：快速键入或不支持 bracketed paste 的终端粘贴时，
         // 避免每个字符都触发一次整屏绘制。上限防止持续输入饿死串口事件处理。
@@ -384,6 +385,62 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
             terminal.draw(|frame| ui::draw(frame, app))?;
             app.dirty = false;
         }
+        if app.mouse_capture != mouse_capture {
+            mouse_capture = app.mouse_capture;
+            if mouse_capture {
+                execute!(io::stdout(), EnableMouseCapture)?;
+            } else {
+                execute!(io::stdout(), DisableMouseCapture)?;
+            }
+        }
+        if let Some(text) = app.clipboard.take() {
+            copy_to_clipboard(&text)?;
+        }
     }
     Ok(())
+}
+
+/// 通过 OSC 52 把文本写入终端剪贴板（ghostty、kitty、WezTerm、iTerm2、Windows Terminal 等支持）。
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{}\x07", base64(text.as_bytes()))?;
+    stdout.flush()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(TABLE[(n >> (18 - 6 * i) & 0x3f) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(super::base64(input.as_bytes()), expected);
+        }
+    }
 }

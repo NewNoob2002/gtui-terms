@@ -39,7 +39,12 @@ pub enum Event {
         at: u64,
         bytes: Vec<u8>,
     },
-    Written(Vec<u8>),
+    /// Bytes written by the port thread, stamped just before `write_all` so a
+    /// reply received afterwards never sorts ahead of the data that caused it.
+    Sent {
+        at: u64,
+        bytes: Vec<u8>,
+    },
     WriteFailed(String),
     ToolOutput(String),
     Connected(String),
@@ -238,9 +243,10 @@ pub fn spawn(
                         while let Ok(command) = writes.try_recv() {
                             match command {
                                 Command::Write(data) => {
+                                    let at = crate::app::now_ms();
                                     match port.write_all(&data).and_then(|()| port.flush()) {
                                         Ok(()) => {
-                                            let _ = tx.send(Event::Written(data));
+                                            let _ = tx.send(Event::Sent { at, bytes: data });
                                         }
                                         Err(err) => {
                                             let _ = tx.send(Event::WriteFailed(err.to_string()));

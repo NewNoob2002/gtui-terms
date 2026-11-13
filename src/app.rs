@@ -30,7 +30,7 @@ const PACKET_CAP: usize = 2000;
 /// Default idle gap that closes an RX packet; reads closer than this are one frame.
 pub const PACKET_GAP_MS: u64 = 20;
 /// Toolbar buttons drawn by `ui::draw_toolbar`, in `toolbar_action` order.
-pub const TOOLBAR_ITEMS: usize = 11;
+pub const TOOLBAR_ITEMS: usize = 13;
 /// Upper bound for one merged RX packet so a continuous stream still splits.
 const PACKET_MAX_BYTES: usize = 4096;
 
@@ -134,6 +134,18 @@ pub enum Popup {
     ConfirmTool,
 }
 
+/// 接收区内的鼠标拖选，坐标为屏幕单元格（列, 行）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+    /// 已松开鼠标：绘制时复制一次选区文本。
+    pub done: bool,
+    pub copied: bool,
+    /// 拖选开始时处于跟随尾部，结束后恢复跟随。
+    pub was_following: bool,
+}
+
 #[derive(Clone, Copy)]
 pub enum Hit {
     Toolbar(usize),
@@ -173,6 +185,15 @@ pub struct App {
     /// 内置烧录器擦写时使用的波特率；只读查询固定 115200。
     pub flash_baud: u32,
     pub scroll_locked: bool,
+    /// TX 记录与 RX 混排在同一输出区（默认），否则右侧单独显示。
+    pub tx_inline: bool,
+    /// 应用捕获鼠标；关闭后可用终端原生选择复制。
+    pub mouse_capture: bool,
+    pub selection: Option<Selection>,
+    /// 待写入系统剪贴板的文本，由主循环通过 OSC 52 发送。
+    pub clipboard: Option<String>,
+    /// 接收区文本区域，由 UI 绘制时更新，用于拖选坐标裁剪。
+    pub rx_area: Rect,
     pub rx_packets: VecDeque<Packet>,
     pub tx_packets: VecDeque<Packet>,
     pub rx_packet_dropped: usize,
@@ -197,6 +218,8 @@ pub struct App {
     pub cache_version: u64,
     pub starts: Vec<usize>,
     pub cache_dropped: usize,
+    /// 与 `cache` 一一对应：该行是否为上一行的自动折行（复制时不插入换行）。
+    pub cache_cont: Vec<bool>,
     pub total_rows: usize,
     pub scroll_back: usize,
     pub view_height: u16,
@@ -291,6 +314,11 @@ impl App {
             flash_baud: crate::esptool::DEFAULT_FLASH_BAUD,
             show_packets: false,
             scroll_locked: false,
+            tx_inline: true,
+            mouse_capture: true,
+            selection: None,
+            clipboard: None,
+            rx_area: Rect::default(),
             rx_packets: VecDeque::new(),
             tx_packets: VecDeque::new(),
             rx_packet_dropped: 0,
@@ -316,6 +344,7 @@ impl App {
             starts: Vec::new(),
             total_rows: 0,
             cache_dropped: 0,
+            cache_cont: Vec::new(),
             scroll_back: 0,
             view_height: 1,
             search_query: None,
@@ -682,8 +711,7 @@ impl App {
         Ok(())
     }
 
-    fn record_tx(&mut self, bytes: Vec<u8>) {
-        let at = now_ms();
+    fn record_tx(&mut self, at: u64, bytes: Vec<u8>) {
         self.record_session(at, "TX", &bytes);
         self.tx_bytes += bytes.len() as u64;
         self.tx_packet_dropped += retain_packet(
@@ -692,6 +720,9 @@ impl App {
             Packet::new(at, bytes),
             None,
         );
+        if self.tx_inline {
+            self.version += 1;
+        }
         self.dirty = true;
     }
 
@@ -748,9 +779,9 @@ impl App {
         match event {
             Event::Data(bytes) => self.on_received(now_ms(), bytes),
             Event::Received { at, bytes } => self.on_received(at, bytes),
-            Event::Written(bytes) => {
+            Event::Sent { at, bytes } => {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
-                self.record_tx(bytes);
+                self.record_tx(at, bytes);
             }
             Event::WriteFailed(error) => {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
@@ -889,6 +920,8 @@ impl App {
             8 => self.toggle_packets(),
             9 => self.toggle_timestamps(),
             10 => self.clear(),
+            11 => self.toggle_mouse(),
+            12 => self.toggle_tx_view(),
             _ => {}
         }
         self.dirty = true;
@@ -995,6 +1028,40 @@ impl App {
         self.starts.clear();
         self.cache_width = 0;
         self.version += 1;
+    }
+
+    fn toggle_mouse(&mut self) {
+        self.mouse_capture = !self.mouse_capture;
+        self.clear_selection();
+        self.status = if self.mouse_capture {
+            "mouse: app (drag in output copies, wheel scrolls)".to_string()
+        } else {
+            "mouse: terminal (native selection; toolbar clicks and wheel scrolling are off)"
+                .to_string()
+        };
+        self.dirty = true;
+    }
+
+    fn toggle_tx_view(&mut self) {
+        self.tx_inline = !self.tx_inline;
+        self.tx_scroll_back = 0;
+        self.version += 1;
+        self.status = if self.tx_inline {
+            "TX shown inline with RX".to_string()
+        } else {
+            "TX shown in its own pane".to_string()
+        };
+        self.dirty = true;
+    }
+
+    /// 取消拖选；若拖选前在跟随尾部，则恢复跟随。
+    pub fn clear_selection(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            if selection.was_following && !self.scroll_locked {
+                self.scroll_back = 0;
+            }
+            self.dirty = true;
+        }
     }
 
     fn toggle_timestamps(&mut self) {
@@ -1325,7 +1392,55 @@ impl App {
             }
             return;
         }
+        let cell = (
+            event.column.clamp(
+                self.rx_area.x,
+                self.rx_area.right().saturating_sub(1).max(self.rx_area.x),
+            ),
+            event.row.clamp(
+                self.rx_area.y,
+                self.rx_area.bottom().saturating_sub(1).max(self.rx_area.y),
+            ),
+        );
         match event.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = &mut self.selection
+                    && !selection.done
+                {
+                    selection.head = cell;
+                }
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(selection) = &mut self.selection
+                    && !selection.done
+                {
+                    selection.head = cell;
+                    if selection.anchor == selection.head {
+                        self.clear_selection();
+                    } else {
+                        selection.done = true;
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+        if !matches!(event.kind, MouseEventKind::Moved) {
+            self.clear_selection();
+        }
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) if matches!(hit, Some(Hit::Output)) => {
+                self.focus = Focus::Output;
+                self.search_input = None;
+                self.selection = Some(Selection {
+                    anchor: cell,
+                    head: cell,
+                    done: false,
+                    copied: false,
+                    was_following: self.scroll_back == 0 && !self.scroll_locked,
+                });
+            }
             MouseEventKind::Down(MouseButton::Left) => match hit {
                 Some(Hit::Toolbar(index)) => {
                     self.toolbar_selected = index;
@@ -1372,6 +1487,12 @@ impl App {
             return;
         }
         self.dirty = true;
+        if self.selection.is_some() {
+            self.clear_selection();
+            if key.code == KeyCode::Esc {
+                return;
+            }
+        }
         if let Some(dialog) = &mut self.settings_dialog {
             let action = dialog.on_key(key);
             self.settings_action(action);
@@ -1994,7 +2115,7 @@ impl App {
             }
             None if self.demo => {
                 self.status = format!("{len} byte(s) sent to demo device");
-                self.record_tx(bytes);
+                self.record_tx(now_ms(), bytes);
             }
             None => self.status = "no port open".to_string(),
         }
@@ -2134,6 +2255,18 @@ impl App {
                     }
                 }
                 self.dirty = true;
+                return;
+            }
+            "mouse" | "mouse on" | "mouse off" => {
+                if rest == "mouse" || self.mouse_capture != rest.ends_with("on") {
+                    self.toggle_mouse();
+                }
+                return;
+            }
+            "txview" | "txview inline" | "txview split" => {
+                if rest == "txview" || self.tx_inline != rest.ends_with("inline") {
+                    self.toggle_tx_view();
+                }
                 return;
             }
             "packets" | "packets on" | "packets off" => {
@@ -2525,7 +2658,7 @@ impl App {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 Event::HookDone { .. } => hook_done = Some(event),
-                Event::Written(_)
+                Event::Sent { .. }
                 | Event::WriteFailed(_)
                 | Event::ControlDone(_)
                 | Event::ToolOutput(_) => self.on_event(event),
@@ -2792,7 +2925,10 @@ mod tests {
         ));
         app.execute("/quit");
         assert!(!app.quit);
-        app.on_event(Event::Written(Vec::new()));
+        app.on_event(Event::Sent {
+            at: crate::app::now_ms(),
+            bytes: Vec::new(),
+        });
         assert_eq!(app.pending_controls, 3);
         for text in [
             "chip reset",
@@ -2836,7 +2972,12 @@ mod tests {
         app.tx
             .send(Event::ControlDone("chip reset".to_string()))
             .unwrap();
-        app.tx.send(Event::Written(b"A".to_vec())).unwrap();
+        app.tx
+            .send(Event::Sent {
+                at: crate::app::now_ms(),
+                bytes: b"A".to_vec(),
+            })
+            .unwrap();
         app.tx
             .send(Event::ToolOutput("queued output\n".to_string()))
             .unwrap();
@@ -2876,7 +3017,10 @@ mod tests {
             panic!("expected write");
         };
         assert_eq!(bytes, [0x41, 0, 0xff]);
-        app.on_event(Event::Written(bytes));
+        app.on_event(Event::Sent {
+            at: crate::app::now_ms(),
+            bytes,
+        });
         assert_eq!(app.pending_writes, 0);
         assert_eq!(app.tx_bytes, 3);
         app.on_event(Event::Data(b"device\n".to_vec()));
