@@ -13,6 +13,8 @@ pub struct Config {
     pub timestamps: Option<bool>,
     /// Idle gap in ms that closes an RX packet in packet view (0 = one packet per read).
     pub packet_gap_ms: Option<u64>,
+    /// Baud rate used by the built-in flasher for erase/write (default 460800).
+    pub flash_baud: Option<u32>,
     pub log: Option<PathBuf>,
     pub elf: Option<PathBuf>,
     /// Line ending appended to sent text: crlf (default), lf, cr, none.
@@ -74,6 +76,7 @@ impl Config {
         self.port = other.port.or_else(|| self.port.take());
         self.timestamps = other.timestamps.or(self.timestamps);
         self.packet_gap_ms = other.packet_gap_ms.or(self.packet_gap_ms);
+        self.flash_baud = other.flash_baud.or(self.flash_baud);
         self.log = other.log.or_else(|| self.log.take());
         self.elf = other.elf.or_else(|| self.elf.take());
         self.eol = other.eol.or_else(|| self.eol.take());

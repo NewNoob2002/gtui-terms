@@ -170,6 +170,9 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| PathBuf::from(config::LOCAL_FILE));
     app.settings = settings;
     app.auto_reset = !(args.no_reset || cfg.no_reset.unwrap_or(false));
+    if let Some(baud) = cfg.flash_baud.filter(|baud| *baud > 0) {
+        app.flash_baud = baud;
+    }
     if let Some(gap) = cfg.packet_gap_ms {
         app.packet_gap_ms = gap.min(60_000);
     }

@@ -168,6 +168,8 @@ pub struct App {
     pub show_packets: bool,
     /// Idle gap (ms) that closes an RX packet; 0 keeps every read as its own packet.
     pub packet_gap_ms: u64,
+    /// 内置烧录器擦写时使用的波特率；只读查询固定 115200。
+    pub flash_baud: u32,
     pub scroll_locked: bool,
     pub rx_packets: VecDeque<Packet>,
     pub tx_packets: VecDeque<Packet>,
@@ -284,6 +286,7 @@ impl App {
             dirty: true,
             show_timestamps,
             packet_gap_ms: PACKET_GAP_MS,
+            flash_baud: crate::esptool::DEFAULT_FLASH_BAUD,
             show_packets: false,
             scroll_locked: false,
             rx_packets: VecDeque::new(),
@@ -914,7 +917,11 @@ impl App {
         if popup == Popup::Save {
             self.prompt_input = format!("session-{}.log", now_ms());
         } else if popup == Popup::Flash {
-            self.prompt_input.clear();
+            self.prompt_input = if std::path::Path::new("build/flasher_args.json").is_file() {
+                "build".to_string()
+            } else {
+                String::new()
+            };
         }
         self.dirty = true;
     }
@@ -955,11 +962,11 @@ impl App {
                     "Reset device (F5)".to_string(),
                     "Enter bootloader (F6)".to_string(),
                     "Load ELF symbols...".to_string(),
-                    "Chip information (esptool)".to_string(),
-                    "Flash information (esptool)".to_string(),
-                    "Read MAC (esptool)".to_string(),
+                    "Chip information (built-in)".to_string(),
+                    "Flash information (built-in)".to_string(),
+                    "Read MAC (built-in)".to_string(),
                     "Erase entire Flash...".to_string(),
-                    "Flash firmware images...".to_string(),
+                    "Flash firmware (build dir, ELF or images)...".to_string(),
                 ];
                 items.extend(
                     self.hooks
@@ -1091,14 +1098,20 @@ impl App {
 
     fn prepare_esptool(&mut self, operation: crate::esptool::Operation, arguments: &str) {
         if self.demo || self.label.is_empty() {
-            self.status = "Select and connect a real serial port before using esptool".to_string();
+            self.status =
+                "Select and connect a real serial port before using ESP tools".to_string();
             return;
         }
         if self.hook_running.is_some() {
             self.status = "Wait for the running tool before starting another".to_string();
             return;
         }
-        match crate::esptool::build(&self.label, self.settings.baud, operation, arguments) {
+        let baud = if operation.destructive() {
+            self.flash_baud
+        } else {
+            115_200
+        };
+        match crate::esptool::build(&self.label, baud, operation, arguments) {
             Ok(invocation) if operation.destructive() => {
                 self.pending_tool = Some(invocation);
                 self.open_popup(Popup::ConfirmTool);
@@ -1117,7 +1130,8 @@ impl App {
         };
         self.shutdown_worker();
         self.repeat = None;
-        self.status = format!("esptool running: {}", invocation.summary);
+        let first = invocation.summary.lines().next().unwrap_or_default();
+        self.status = format!("ESP tool running: {first}");
         self.hook_running = Some("esptool".to_string());
         self.reopen_after_hook = reopen;
         self.popup = None;
@@ -1144,10 +1158,16 @@ impl App {
                     Err(err) => self.status = err,
                 }
             }
-            Some(Popup::Flash) => self.prepare_esptool(
-                crate::esptool::Operation::WriteFlash,
-                &self.prompt_input.clone(),
-            ),
+            Some(Popup::Flash) => {
+                // 单个路径 = 一键烧录工程/ELF；<offset> <file> 成对 = 原始镜像写入。
+                let input = self.prompt_input.clone();
+                let operation = if crate::esptool::is_single_path(&input) {
+                    crate::esptool::Operation::Flash
+                } else {
+                    crate::esptool::Operation::WriteFlash
+                };
+                self.prepare_esptool(operation, &input);
+            }
             Some(Popup::ConfirmTool) => {
                 if self.hook_running.is_some() {
                     self.status = "Wait for the running tool before confirming another".to_string();
@@ -2151,8 +2171,24 @@ impl App {
                 "read-mac" => crate::esptool::Operation::ReadMac,
                 "erase-flash" => crate::esptool::Operation::EraseFlash,
                 "write-flash" => crate::esptool::Operation::WriteFlash,
+                "flash" => crate::esptool::Operation::Flash,
+                "baud" => {
+                    match arguments.trim().parse::<u32>() {
+                        Ok(baud) if (9600..=5_000_000).contains(&baud) => {
+                            self.flash_baud = baud;
+                            self.status = format!("flash baud {baud}");
+                        }
+                        _ => {
+                            self.status = format!(
+                                "usage: /esp baud <9600-5000000> (current {})",
+                                self.flash_baud
+                            )
+                        }
+                    }
+                    return;
+                }
                 _ => {
-                    self.status = "ESP commands: chip-id, flash-id, read-mac, erase-flash, write-flash <offset> <file> ...".to_string();
+                    self.status = "ESP commands: chip-id, flash-id, read-mac, erase-flash, flash <build dir|app.elf>, write-flash <offset> <file> ..., baud <n>".to_string();
                     return;
                 }
             };
